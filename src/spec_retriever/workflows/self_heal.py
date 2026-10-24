@@ -103,7 +103,7 @@ def _source_table_rows(table: Table) -> list[list[str]]:
 
 
 def _document_text_preserved(path: Path, clauses: list[dict], warnings: list[dict]) -> list[str]:
-    """Check ordered top-level paragraphs and physical table cells exactly."""
+    """Check ordered nonempty paragraph text (trimmed) and physical table cells."""
     document = Document(path)
     styles = _Styles(document)
     source_events = []
@@ -206,7 +206,8 @@ def validate_candidate(manifest_path: Path, candidate_db: Path, previous_db: Pat
                                     if warning.get("code") == "duplicate_identical_heading"]
                                     if item.spec in failed_specs else []})
         return {"ingestion_complete": True, "documents": results,
-                "source_text_preserved": True, "unaffected_documents_unchanged": True}
+                "nonempty_text_order_preserved": True,
+                "table_cells_preserved": True, "unaffected_documents_unchanged": True}
 
 
 def _changed_paths(checkout: Path) -> list[str]:
@@ -398,7 +399,8 @@ def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | 
                       "commit, push, or access the network. Return exact old_text/new_text edits "
                       "for src/spec_retriever/spec_store/docx_parser.py; each old_text must be "
                       "copied from the file and occur exactly once. "
-                      "Preserve every source paragraph and table. Make the smallest generalizable parser fix. "
+                      "Preserve nonempty paragraph text, its source order, and all table cells. "
+                      "Make the smallest generalizable parser fix. "
                       "For a duplicate clause heading, coalesce only if adjacent text is identical "
                       "and the first heading has no body. Keep one heading block; record the "
                       "second source location only in a duplicate_identical_heading warning "
@@ -481,8 +483,10 @@ def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | 
                                  "Approved repair policy: adjacent, text-identical numbered headings "
                                  "with no first-clause body may be coalesced into one heading block "
                                  "if a warning records both exact source locations. The trusted "
-                                 "validator independently checks this warning and verifies every "
-                                 "source paragraph and table cell. Do not reject this approved "
+                                 "validator independently checks this warning, source order of "
+                                 "nonempty trimmed paragraph text, and every table cell. Empty "
+                                 "paragraphs and leading/trailing whitespace are intentionally "
+                                 "not indexed. Do not reject this approved "
                                  "policy merely because the second heading is represented by "
                                  "a warning instead of a duplicate block. "
                                  "Approve only if the change preserves specification text, "
@@ -529,7 +533,7 @@ def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | 
                 "Failure type: DOCX parse error. The exact diagnostic is retained "
                 "in the local self-heal report.\n\n"
                 "Validation: full locked-manifest import completed; source checksums, "
-                "paragraphs, and table cells were preserved; previously indexed "
+                "nonempty paragraph text and order, and table cells were preserved; previously indexed "
                 "documents were unchanged; independent read-only review approved.\n\n"
                 "The original 3GPP DOCX and generated corpus are not part of this PR.\n",
                 encoding="utf-8")
