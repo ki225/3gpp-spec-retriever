@@ -23,6 +23,7 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 
 from spec_retriever.spec_store.manifest import load_manifest, sha256_file
+from spec_retriever.spec_store.docx_parser import NUMBERED, _Styles, _heading_level, _is_toc
 from spec_retriever.spec_store.store import Corpus
 
 
@@ -93,6 +94,7 @@ def _source_table_rows(table: Table) -> list[list[str]]:
 def _document_text_preserved(path: Path, clauses: list[dict], warnings: list[dict]) -> list[str]:
     """Check top-level paragraphs and physical table cells against parsed blocks."""
     document = Document(path)
+    styles = _Styles(document)
     source = Counter()
     source_tables = []
     by_location = {}
@@ -107,11 +109,31 @@ def _document_text_preserved(path: Path, clauses: list[dict], warnings: list[dic
     output = Counter(block["text"].strip() for clause in clauses
                      for block in clause["blocks"]
                      if block["kind"] in {"heading", "paragraph"} and block["text"].strip())
+    credited_locations = set()
     for warning in warnings:
         if warning.get("code") == "duplicate_identical_heading":
-            index = warning.get("duplicate_location", {}).get("body_index")
-            if index in by_location:
-                output[by_location[index]] += 1
+            first = warning.get("first_location", {}).get("body_index")
+            duplicate = warning.get("duplicate_location", {}).get("body_index")
+            if (type(first) is not int or type(duplicate) is not int
+                    or duplicate != first + 1 or duplicate in credited_locations
+                    or first not in by_location or duplicate not in by_location
+                    or by_location[first] != by_location[duplicate]):
+                raise ValueError("unverified duplicate-heading warning in candidate index")
+            first_paragraph = Paragraph(document.element.body[first], document)
+            duplicate_paragraph = Paragraph(document.element.body[duplicate], document)
+            match = NUMBERED.match(by_location[first])
+            if (not match or match.group(1) != warning.get("clause_id")
+                    or any(_heading_level(paragraph, styles) is None or _is_toc(paragraph, styles)
+                           for paragraph in (first_paragraph, duplicate_paragraph))
+                    or not any(clause["clause_id"] == warning["clause_id"]
+                               and any(block["kind"] == "heading"
+                                       and block["text"].strip() == by_location[first]
+                                       and block["location"].get("body_index") == first
+                                       for block in clause["blocks"])
+                               for clause in clauses)):
+                raise ValueError("duplicate-heading warning does not match source heading")
+            credited_locations.add(duplicate)
+            output[by_location[duplicate]] += 1
     missing = list((source - output).elements())[:5]
     output_tables = [[[(cell["text"]) for cell in row] for row in block["rows"]]
                      for clause in clauses for block in clause["blocks"] if block["kind"] == "table"]
@@ -164,8 +186,9 @@ def validate_candidate(manifest_path: Path, candidate_db: Path, previous_db: Pat
 
 def _changed_paths(checkout: Path) -> list[str]:
     changed = _checked(["git", "diff", "--name-only", "HEAD"], cwd=checkout).stdout.splitlines()
+    staged = _checked(["git", "diff", "--cached", "--name-only"], cwd=checkout).stdout.splitlines()
     untracked = _checked(["git", "ls-files", "--others", "--exclude-standard"], cwd=checkout).stdout.splitlines()
-    return sorted(set(changed + untracked))
+    return sorted(set(changed + staged + untracked))
 
 
 def _allowed_changes(checkout: Path) -> list[str]:
@@ -272,7 +295,12 @@ def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | 
                        "-s", "workspace-write", "-o", str(output)]
             command += ["-m", model]
             command.append("-")
-            response = _run(command, cwd=checkout, timeout=timeout, input_text=prompt)
+            try:
+                response = _run(command, cwd=checkout, timeout=timeout, input_text=prompt)
+            except subprocess.TimeoutExpired:
+                result["attempts"].append({"number": attempt, "agent_exit": 124,
+                                           "feedback": "repair agent timed out"})
+                continue
             (run_dir / f"agent-{attempt}.log").write_text(
                 response.stdout + "\n" + response.stderr, encoding="utf-8")
             attempt_result = {"number": attempt, "agent_exit": response.returncode}
@@ -342,7 +370,8 @@ def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | 
                 if publish_pr:
                     break
                 return _write_report(report_file, result)
-            except (ValueError, RuntimeError, OSError, json.JSONDecodeError) as exc:
+            except (ValueError, RuntimeError, OSError, json.JSONDecodeError,
+                    subprocess.TimeoutExpired) as exc:
                 attempt_result["feedback"] = str(exc)
         if result["status"] == "validated":
             title = f"Fix TS {target.spec} DOCX ingestion"
