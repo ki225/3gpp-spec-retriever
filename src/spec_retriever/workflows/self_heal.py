@@ -156,7 +156,7 @@ def _write_report(path: Path, result: dict) -> dict:
 
 def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | Path,
                 directory: str | Path, base: str = "main", remote: str = "origin",
-                model: str | None = None, review_model: str | None = None,
+                model: str = "gpt-5.6-sol", review_model: str | None = None,
                 max_attempts: int = 2, publish_pr: bool = True,
                 timeout: int = 900) -> dict:
     """Repair only recorded parse failures; source refresh remains sync-documents' job."""
@@ -217,14 +217,16 @@ def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | 
                       "Modify only src/spec_retriever/spec_store/ or src/spec_retriever/sync/. "
                       "Preserve every source paragraph and table; do not edit the DOCX, manifest, "
                       "Git configuration, or workflow. Make the smallest generalizable parser fix. "
+                      "For a duplicate clause heading, coalesce only if adjacent text is identical "
+                      "and the first heading has no body; record both source locations in a warning. "
+                      "Keep rejecting distinct duplicate headings. "
                       "Do not commit, push, or create a PR. Use the available Python environment "
                       f"at {sys.executable}. Previous validation feedback: "
                       f"{result['attempts'][-1].get('feedback', '') if result['attempts'] else 'none'}")
             output = run_dir / f"agent-{attempt}.txt"
             command = [agent, "exec", "--ephemeral", "-C", str(checkout),
                        "-s", "workspace-write", "-o", str(output)]
-            if model:
-                command += ["-m", model]
+            command += ["-m", model]
             command.append("-")
             response = _run(command, cwd=checkout, timeout=timeout, input_text=prompt)
             (run_dir / f"agent-{attempt}.log").write_text(
@@ -232,7 +234,13 @@ def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | 
             attempt_result = {"number": attempt, "agent_exit": response.returncode}
             result["attempts"].append(attempt_result)
             if response.returncode:
-                attempt_result["feedback"] = "repair agent failed: " + response.stderr[-500:]
+                messages = response.stdout + "\n" + response.stderr
+                errors = [line for line in messages.splitlines() if "ERROR:" in line]
+                attempt_result["feedback"] = "repair agent failed: " + (
+                    errors[-1] if errors else messages[-500:])
+                if "model_not_found" in messages:
+                    result["status"] = "agent_unavailable"
+                    return _write_report(report_file, result)
                 continue
             try:
                 if _checked(["git", "rev-parse", "HEAD"], cwd=checkout).stdout.strip() != initial_head:
@@ -260,11 +268,10 @@ def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | 
                                  "Approve only if the change preserves specification text, "
                                  "does not hide distinct duplicate clauses, and has no important defect. "
                                  "Do not modify any files. Return JSON matching the schema.")
-                review_command = [agent, "exec", "--ephemeral", "-C", str(checkout),
+                review_command = [agent, "exec", "--ignore-user-config", "--ephemeral", "-C", str(checkout),
                                   "-s", "read-only", "--output-schema", str(schema),
                                   "-o", str(review_output)]
-                if review_model or model:
-                    review_command += ["-m", review_model or model]
+                review_command += ["-m", review_model or model]
                 review_command.append("-")
                 review = _run(review_command, cwd=checkout, timeout=timeout, input_text=review_prompt)
                 (run_dir / f"review-{attempt}.log").write_text(

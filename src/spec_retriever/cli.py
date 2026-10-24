@@ -95,7 +95,7 @@ def parser() -> argparse.ArgumentParser:
     heal.add_argument("--directory", default="evaluation/self-heal")
     heal.add_argument("--base", default="main")
     heal.add_argument("--remote", default="origin")
-    heal.add_argument("--model", help="Codex model for repair; omit to use local default")
+    heal.add_argument("--model", default="gpt-5.6-sol", help="Codex model for repair")
     heal.add_argument("--review-model", help="independent review model; omit to use repair model")
     heal.add_argument("--max-attempts", type=int, default=2, choices=(1, 2))
     heal.add_argument("--timeout", type=int, default=900, help="seconds allowed per agent/validation step")
