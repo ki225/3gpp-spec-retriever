@@ -221,11 +221,28 @@ def _published_pr(checkout: Path, branch: str) -> str | None:
     return lookup.stdout.strip() if lookup.returncode == 0 and lookup.stdout.strip() else None
 
 
+def _sandbox_inputs(manifest, folder: Path) -> Path:
+    folder.mkdir()
+    payload = manifest.payload()
+    for row in payload["documents"]:
+        item = next(item for item in manifest.documents if item.spec == row["spec"])
+        destination = folder / item.spec / "source.docx"
+        destination.parent.mkdir()
+        shutil.copyfile(manifest.document_path(item), destination)
+        if sha256_file(destination) != item.sha256:
+            raise ValueError(f"source changed while copying {item.spec}")
+        row["path"] = f"{item.spec}/source.docx"
+    lockfile = folder / "baseline.lock.json"
+    lockfile.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return lockfile
+
+
 def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | Path,
                 directory: str | Path, base: str = "main", remote: str = "origin",
                 model: str = "gpt-5.6-sol", review_model: str | None = None,
                 max_attempts: int = 2, publish_pr: bool = True,
-                timeout: int = 900) -> dict:
+                timeout: int = 900,
+                validator_image: str = "3gpp-spec-retriever-validator:1") -> dict:
     """Repair only recorded parse failures; source refresh remains sync-documents' job."""
     if max_attempts not in (1, 2):
         raise ValueError("max_attempts must be 1 or 2")
@@ -249,6 +266,7 @@ def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | 
     target = next(item for item in manifest.documents if item.spec in specs)
     if sha256_file(manifest.document_path(target)) != target.sha256:
         raise ValueError("source checksum mismatch; repair source before parser")
+    _checked(["docker", "image", "inspect", validator_image], cwd=repo, timeout=30)
     _checked(["git", "rev-parse", "--show-toplevel"], cwd=repo)
     if publish_pr:
         _checked(["git", "fetch", remote, base], cwd=repo, timeout=timeout)
@@ -276,6 +294,8 @@ def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | 
                 "error": next(row["error"] for row in failed if row["spec"] == target.spec)}
         (checkout / ".self-heal" / "case.json").write_text(
             json.dumps(case, ensure_ascii=False, indent=2), encoding="utf-8")
+        sandbox_input = run_dir / "sandbox-input"
+        _sandbox_inputs(manifest, sandbox_input)
         agent = _agent_command()
         for attempt in range(1, max_attempts + 1):
             prompt = ("You are repairing a reproducible DOCX import failure in this repository. "
@@ -319,12 +339,21 @@ def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | 
                     raise ValueError("repair agent changed Git history")
                 paths = _allowed_changes(checkout)
                 before_review = {name: sha256_file(checkout / name) for name in paths}
-                candidate_db = run_dir / f"candidate-{attempt}.sqlite3"
-                env = dict(os.environ, PYTHONPATH=str(checkout / "src"))
+                sandbox_output = run_dir / f"sandbox-output-{attempt}"
+                sandbox_output.mkdir()
+                candidate_db = sandbox_output / "corpus.sqlite3"
                 original_manifest_hash = sha256_file(manifest_path)
-                validation = _run([sys.executable, "-m", "spec_retriever.workflows.self_heal",
-                                   "_ingest", str(manifest_path), str(candidate_db)],
-                                  cwd=checkout, env=env, timeout=timeout)
+                validation = _run([
+                    "docker", "run", "--rm", "--network", "none", "--read-only",
+                    "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+                    "--pids-limit", "64", "--memory", "2g", "--cpus", "2",
+                    "--env", "PYTHONPATH=/code/src", "--env", "PYTHONDONTWRITEBYTECODE=1",
+                    "--mount", f"type=bind,src={checkout / 'src'},dst=/code/src,readonly",
+                    "--mount", f"type=bind,src={sandbox_input},dst=/input,readonly",
+                    "--mount", f"type=bind,src={sandbox_output},dst=/output",
+                    validator_image, "python", "-m", "spec_retriever", "ingest",
+                    "/input/baseline.lock.json", "--db", "/output/corpus.sqlite3",
+                ], cwd=repo, timeout=timeout)
                 (run_dir / f"validation-{attempt}.log").write_text(
                     validation.stdout + "\n" + validation.stderr, encoding="utf-8")
                 if validation.returncode:
@@ -421,18 +450,3 @@ def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | 
         return _write_report(report_file, result)
 
 
-def _main() -> int:
-    if len(sys.argv) != 4 or sys.argv[1] != "_ingest":
-        raise SystemExit("internal candidate import: _ingest MANIFEST CANDIDATE_DB")
-    try:
-        with Corpus(Path(sys.argv[3])) as corpus:
-            report = corpus.ingest(load_manifest(Path(sys.argv[2])))
-    except Exception as exc:
-        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
-        return 2
-    print(json.dumps(report, ensure_ascii=False))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(_main())

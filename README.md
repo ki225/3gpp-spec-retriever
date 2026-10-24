@@ -129,6 +129,7 @@ Use `--required-spec` for expected documents, `--include-references` to select u
 When `ingest` reports `parse_failed`, the optional repair agent can reproduce the error in an isolated Git worktree, patch the parser, re-import the complete locked manifest, and request an independent read-only review. It opens a PR only after all checks pass. Install and authenticate the Codex and GitHub CLIs first:
 
 ```powershell
+docker build -f docker/self-heal.Dockerfile -t 3gpp-spec-retriever-validator:1 .
 python -m spec_retriever heal-import data/baseline.lock.json --db data/corpus.sqlite3
 ```
 

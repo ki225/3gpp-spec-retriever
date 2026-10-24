@@ -99,6 +99,7 @@ def parser() -> argparse.ArgumentParser:
     heal.add_argument("--review-model", help="independent review model; omit to use repair model")
     heal.add_argument("--max-attempts", type=int, default=2, choices=(1, 2))
     heal.add_argument("--timeout", type=int, default=900, help="seconds allowed per agent/validation step")
+    heal.add_argument("--validator-image", default="3gpp-spec-retriever-validator:1")
     heal.add_argument("--no-pr", action="store_true", help="validate locally without pushing or opening a PR")
     for name in ("check-documents", "sync-documents"):
         command = commands.add_parser(name, help="check official Release versions and local document inventory" if name == "check-documents" else "download, ingest, embed and publish an updated document generation")
@@ -175,7 +176,8 @@ def main(argv: list[str] | None = None) -> int:
             result = heal_import(args.manifest, args.db, repo=args.repo, directory=args.directory,
                                  base=args.base, remote=args.remote, model=args.model,
                                  review_model=args.review_model, max_attempts=args.max_attempts,
-                                 publish_pr=not args.no_pr, timeout=args.timeout)
+                                 publish_pr=not args.no_pr, timeout=args.timeout,
+                                 validator_image=args.validator_image)
         elif args.command == "serve":
             from .mcp_server import create_server
 
