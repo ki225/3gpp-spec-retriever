@@ -288,6 +288,19 @@ def parse_docx(path: Path, expected: DocumentSpec) -> ParsedDocument:
                 clause_id, title = f"heading-{body_index}", text
                 warnings.append({"code": "unresolved_heading_number", "location": location, "title": text})
             if clause_id in seen:
+                # Some published DOCX files contain the same heading twice in
+                # adjacent paragraphs. Keep one clause when the first heading
+                # has no body yet; any other collision may hide real content.
+                if (current.clause_id == clause_id and current.title == title
+                        and len(current.blocks) == 1
+                        and current.blocks[0]["kind"] == "heading"
+                        and current.blocks[0]["text"] == text
+                        and current.blocks[0]["location"]["body_index"] == body_index - 1):
+                    warnings.append({"code": "duplicate_identical_heading",
+                                     "clause_id": clause_id,
+                                     "first_location": current.blocks[0]["location"],
+                                     "duplicate_location": location})
+                    continue
                 raise ValueError(f"duplicate clause ID {clause_id}; numbering needs review")
             seen.add(clause_id)
             level = level or clause_id.count(".") + 1

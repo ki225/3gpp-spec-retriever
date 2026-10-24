@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 
 from spec_retriever.spec_store.manifest import load_manifest, lock_manifest
@@ -87,6 +88,18 @@ def parser() -> argparse.ArgumentParser:
     review = commands.add_parser("review", help="check clause-by-clause analysis coverage and evidence provenance")
     review.add_argument("bundle")
     review.add_argument("review")
+    heal = commands.add_parser("heal-import", help="repair a recorded DOCX parse failure and open a reviewed PR")
+    heal.add_argument("manifest", help="locked manifest for the failed baseline")
+    heal.add_argument("--db", required=True)
+    heal.add_argument("--repo", default=".")
+    heal.add_argument("--directory", default="evaluation/self-heal")
+    heal.add_argument("--base", default="main")
+    heal.add_argument("--remote", default="origin")
+    heal.add_argument("--model", help="Codex model for repair; omit to use local default")
+    heal.add_argument("--review-model", help="independent review model; omit to use repair model")
+    heal.add_argument("--max-attempts", type=int, default=2, choices=(1, 2))
+    heal.add_argument("--timeout", type=int, default=900, help="seconds allowed per agent/validation step")
+    heal.add_argument("--no-pr", action="store_true", help="validate locally without pushing or opening a PR")
     for name in ("check-documents", "sync-documents"):
         command = commands.add_parser(name, help="check official Release versions and local document inventory" if name == "check-documents" else "download, ingest, embed and publish an updated document generation")
         command.add_argument("manifest", help="locked manifest; or @PATH to a managed current.json pointer")
@@ -156,6 +169,13 @@ def main(argv: list[str] | None = None) -> int:
             from spec_retriever.workflows.review import review_bundle
 
             result = review_bundle(args.bundle, args.review)
+        elif args.command == "heal-import":
+            from spec_retriever.workflows.self_heal import heal_import
+
+            result = heal_import(args.manifest, args.db, repo=args.repo, directory=args.directory,
+                                 base=args.base, remote=args.remote, model=args.model,
+                                 review_model=args.review_model, max_attempts=args.max_attempts,
+                                 publish_pr=not args.no_pr, timeout=args.timeout)
         elif args.command == "serve":
             from .mcp_server import create_server
 
@@ -260,10 +280,13 @@ def main(argv: list[str] | None = None) -> int:
                              missing_reference_specs=sorted({row["spec"] for row in result.get("missing_references", [])}))
         print(json.dumps(displayed, ensure_ascii=False, indent=2))
         return 2 if ((args.command == "ingest" and not result["ingestion_complete"])
+                     or (args.command == "heal-import" and result["status"] not in
+                         {"pr_created", "validated", "no_parse_failure"})
                      or (args.command == "check-documents" and (not result["all_selected_current"] or result["missing_references"]))
                      or (args.command == "audit" and not result["scope_ready"])
                      or (args.command == "review" and (not result["review_coverage_complete"] or not result["scope_ready"]))) else 0
-    except (ValueError, OSError, json.JSONDecodeError, KeyError) as error:
+    except (ValueError, OSError, RuntimeError, subprocess.TimeoutExpired,
+            json.JSONDecodeError, KeyError) as error:
         print(json.dumps({"error": str(error)}, ensure_ascii=False), file=sys.stderr)
         return 2
 
