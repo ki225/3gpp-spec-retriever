@@ -12,3 +12,4 @@ evaluation/
 *.sqlite3-*
 .codebase-memory/
 reports/
+.self-heal/

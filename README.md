@@ -123,3 +123,14 @@ python -m spec_retriever search "NssaiAvailabilityInfo" --db data/corpus.sqlite3
 ```
 
 Use `--required-spec` for expected documents, `--include-references` to select undated or same-Release references, and `--series` to compare an official series. Explicit version references remain pinned.
+
+### 6. Repair a failed DOCX import
+
+When `ingest` reports `parse_failed`, the optional repair agent can reproduce the error in an isolated Git worktree, patch the parser, re-import the complete locked manifest, and request an independent read-only review. It opens a PR only after all checks pass. Install and authenticate the Codex and GitHub CLIs first:
+
+```powershell
+docker build -f docker/self-heal.Dockerfile -t 3gpp-spec-retriever-validator:1 .
+python -m spec_retriever heal-import data/baseline.lock.json --db data/corpus.sqlite3
+```
+
+Use `--no-pr` to exercise the repair and validation without pushing a branch. A report and worktree remain under the ignored `evaluation/self-heal/` directory. The agent repairs code-level import failures; use `sync-documents` for missing, damaged, or outdated source files. It never modifies the official DOCX or merges its own PR.
