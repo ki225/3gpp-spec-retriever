@@ -448,4 +448,3 @@ def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | 
             result["status"] = "failed"
         result["error"] = f"{type(exc).__name__}: {exc}"
         return _write_report(report_file, result)
-
