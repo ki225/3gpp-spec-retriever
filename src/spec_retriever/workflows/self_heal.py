@@ -122,13 +122,17 @@ def _document_text_preserved(path: Path, clauses: list[dict], warnings: list[dic
 
 def validate_candidate(manifest_path: Path, candidate_db: Path, previous_db: Path,
                        failed_specs: set[str]) -> dict:
-    """Run in a fresh process with PYTHONPATH pointing at the candidate checkout."""
+    """Verify candidate-produced SQLite in the trusted orchestrator process.
+
+    Candidate Python runs only in a separate subprocess and is never imported
+    here, so it cannot monkeypatch these checks in memory.
+    """
     manifest = load_manifest(manifest_path)
     for item in manifest.documents:
         if sha256_file(manifest.document_path(item)) != item.sha256:
             raise ValueError(f"source checksum changed: {item.spec}")
     with Corpus(candidate_db) as candidate:
-        status = candidate.ingest(manifest)
+        status = candidate.status(manifest.baseline)
         if not status["ingestion_complete"]:
             raise ValueError("candidate import is incomplete: " + json.dumps(
                 [{"spec": row["spec"], "error": row["error"]} for row in status["documents"]
@@ -289,15 +293,19 @@ def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | 
                 before_review = {name: sha256_file(checkout / name) for name in paths}
                 candidate_db = run_dir / f"candidate-{attempt}.sqlite3"
                 env = dict(os.environ, PYTHONPATH=str(checkout / "src"))
+                original_manifest_hash = sha256_file(manifest_path)
                 validation = _run([sys.executable, "-m", "spec_retriever.workflows.self_heal",
-                                   "_validate", str(manifest_path), str(candidate_db),
-                                   str(database), target.spec], cwd=checkout, env=env, timeout=timeout)
+                                   "_ingest", str(manifest_path), str(candidate_db)],
+                                  cwd=checkout, env=env, timeout=timeout)
                 (run_dir / f"validation-{attempt}.log").write_text(
                     validation.stdout + "\n" + validation.stderr, encoding="utf-8")
                 if validation.returncode:
-                    raise ValueError("candidate validation failed: " +
+                    raise ValueError("candidate ingestion failed: " +
                                      (validation.stderr or validation.stdout)[-800:])
-                attempt_result["validation"] = json.loads(validation.stdout)
+                if sha256_file(manifest_path) != original_manifest_hash:
+                    raise ValueError("candidate changed the locked manifest")
+                attempt_result["validation"] = validate_candidate(
+                    manifest_path, candidate_db, database, specs)
                 attempt_result["changed_paths"] = paths
                 schema = run_dir / "review-schema.json"
                 schema.write_text(json.dumps(REVIEW_SCHEMA), encoding="utf-8")
@@ -385,11 +393,11 @@ def heal_import(manifest_path: str | Path, database: str | Path, *, repo: str | 
 
 
 def _main() -> int:
-    if len(sys.argv) != 6 or sys.argv[1] != "_validate":
-        raise SystemExit("internal validation: _validate MANIFEST CANDIDATE_DB PREVIOUS_DB SPEC")
+    if len(sys.argv) != 4 or sys.argv[1] != "_ingest":
+        raise SystemExit("internal candidate import: _ingest MANIFEST CANDIDATE_DB")
     try:
-        report = validate_candidate(Path(sys.argv[2]), Path(sys.argv[3]),
-                                    Path(sys.argv[4]), {sys.argv[5]})
+        with Corpus(Path(sys.argv[3])) as corpus:
+            report = corpus.ingest(load_manifest(Path(sys.argv[2])))
     except Exception as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
