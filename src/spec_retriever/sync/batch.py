@@ -208,7 +208,9 @@ def build(config: Config, *, dry_run: bool = False, refresh: bool = False,
 
         baseline = None
         ingestion = None
-        if documents:
+        # A partial inventory would produce a different manifest digest on
+        # resume, forcing every already-indexed document to be parsed again.
+        if documents and len(documents) == inventory["selected_count"] and not failures:
             preliminary = Manifest("pending", config.release, tuple(documents), run)
             baseline = f"r{config.release}-all-{preliminary.digest[:16]}"
             manifest = Manifest(baseline, config.release, tuple(documents), run)
