@@ -138,9 +138,10 @@ def extract_document(archive: bytes | Path, spec: str, destination: Path) -> tup
     """Extract a single document or merge an official section-split bundle."""
     try:
         with zipfile.ZipFile(archive if isinstance(archive, Path) else io.BytesIO(archive)) as bundle:
-            prefix = spec.replace('.', '') + '-'
+            stem = spec.replace('.', '')
+            prefixes = (stem + '-', stem + '.')
             candidates = [item for item in bundle.infolist()
-                          if PurePosixPath(item.filename).name.lower().startswith(prefix)
+                          if PurePosixPath(item.filename).name.lower().startswith(prefixes)
                           and PurePosixPath(item.filename).suffix.lower() in {".doc", ".docx"}
                           and not item.is_dir()]
             if not candidates:
