@@ -243,12 +243,18 @@ def parse_docx(path: Path, expected: DocumentSpec) -> ParsedDocument:
     header_identities = set(IDENTITY.findall("\n".join(header_footer)))
     # STYLEREF/revision fields can concatenate current and previous header
     # versions. The explicit cover is authoritative when it identifies a spec.
-    identities = cover_identities or header_identities
     if cover_identities and header_identities - cover_identities:
         warnings.append({"code": "header_identity_differs_from_cover", "message": "cover identity used; header fields require review"})
-    if identities:
-        if identities != {(expected.spec, expected.version)}:
-            raise ValueError(f"document identity {sorted(identities)} differs from manifest {expected.spec} {expected.version}")
+    if cover_identities:
+        if cover_identities != {(expected.spec, expected.version)}:
+            raise ValueError(f"document identity {sorted(cover_identities)} differs from manifest {expected.spec} {expected.version}")
+    elif header_identities:
+        if any(spec != expected.spec for spec, _ in header_identities):
+            raise ValueError(f"header specification {sorted(header_identities)} differs from manifest {expected.spec}")
+        if header_identities != {(expected.spec, expected.version)}:
+            warnings.append({"code": "header_version_differs_from_manifest",
+                             "header_identities": sorted(header_identities),
+                             "message": "header revision fields may concatenate values; official archive version used"})
     else:
         warnings.append({"code": "document_identity_not_detected", "message": "identity relies on manifest metadata and checksum"})
 
