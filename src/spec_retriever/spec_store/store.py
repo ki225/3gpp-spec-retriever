@@ -155,6 +155,24 @@ class Corpus:
                     result = parse_docx(path, item)
                     if not result.clauses:
                         status, error, result = "parse_failed", "parser produced no clauses", None
+                    if result is not None:
+                        metadata_path = path.with_name("source.json")
+                        if metadata_path.is_file():
+                            source = json.loads(metadata_path.read_text(encoding="utf-8"))
+                            members = source.get("archive_members", [])
+                            for clause in result.clauses:
+                                for block in clause.blocks:
+                                    location = block["location"]
+                                    index = location["body_index"]
+                                    matches = [part for part in members
+                                               if part["body_start"] <= index < part["body_end"]]
+                                    if members and len(matches) != 1:
+                                        raise ValueError(f"multi-part source location is ambiguous at body index {index}")
+                                    if matches:
+                                        part = matches[0]
+                                        location["archive_member"] = part["name"]
+                                        location["archive_member_sha256"] = part["sha256"]
+                                        location["member_body_index"] = index - part["body_start"]
             except FileNotFoundError:
                 status, error = "missing", "source DOCX does not exist"
             except Exception as exception:
@@ -269,6 +287,9 @@ class Corpus:
             raise ValueError(f"exact clause not found: {baseline} / {spec} / {version} / {clause_id}")
         all_rows = self.connection.execute("SELECT * FROM clauses WHERE document_id=? ORDER BY ordinal", (row["document_id"],)).fetchall()
         all_clauses = [json.loads(item["payload"]) for item in all_rows]
+        printed_id = clause_id.split("~", 1)[0]
+        same_printed = [item["clause_id"] for item in all_clauses
+                        if item["clause_id"].split("~", 1)[0] == printed_id]
         descendants = []
         parents = {clause_id}
         for clause in all_clauses:
@@ -277,6 +298,8 @@ class Corpus:
                 descendants.append(clause)
         selected = json.loads(row["payload"])
         return {"baseline": baseline, "spec": spec, "version": version, "clause": selected,
+                "printed_clause_id": printed_id,
+                "same_printed_clause_ids": same_printed,
                 "source_url": row["source_url"], "filename": row["filename"], "sha256": row["sha256"],
                 "children_included": include_children,
                 "descendant_clause_ids": [item["clause_id"] for item in descendants],

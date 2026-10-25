@@ -301,7 +301,16 @@ def parse_docx(path: Path, expected: DocumentSpec) -> ParsedDocument:
                                      "first_location": current.blocks[0]["location"],
                                      "duplicate_location": location})
                     continue
-                raise ValueError(f"duplicate clause ID {clause_id}; numbering needs review")
+                printed_id = clause_id
+                occurrence = 2
+                while f"{printed_id}~{occurrence}" in seen:
+                    occurrence += 1
+                clause_id = f"{printed_id}~{occurrence}"
+                warnings.append({"code": "duplicate_printed_clause_id",
+                                 "printed_clause_id": printed_id,
+                                 "resolved_clause_id": clause_id,
+                                 "location": location,
+                                 "message": "distinct source headings share a printed number; both are retained"})
             seen.add(clause_id)
             level = level or clause_id.count(".") + 1
             while stack and stack[-1][0] >= level:
