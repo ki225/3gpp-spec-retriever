@@ -237,9 +237,17 @@ def parse_docx(path: Path, expected: DocumentSpec) -> ParsedDocument:
             break
     cover_identities = set(IDENTITY.findall("\n".join(cover)))
     header_footer = []
-    for section in document.sections:
-        header_footer.extend(paragraph.text for paragraph in section.header.paragraphs)
-        header_footer.extend(paragraph.text for paragraph in section.footer.paragraphs)
+    for section_index, section in enumerate(document.sections):
+        for part_name in ("header", "footer"):
+            try:
+                part = getattr(section, part_name)
+                header_footer.extend(paragraph.text for paragraph in part.paragraphs)
+            except (AttributeError, KeyError) as error:
+                # Some official DOCX packages point a section header relation
+                # at an image. The specification body remains parseable.
+                warnings.append({"code": "section_header_footer_unavailable",
+                                 "section": section_index, "part": part_name,
+                                 "message": f"{type(error).__name__}: {error}"})
     header_identities = set(IDENTITY.findall("\n".join(header_footer)))
     # STYLEREF/revision fields can concatenate current and previous header
     # versions. The explicit cover is authoritative when it identifies a spec.
