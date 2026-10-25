@@ -1,7 +1,7 @@
 """Resumable, all-series official Release corpus builds."""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -179,22 +179,32 @@ def build(config: Config, *, dry_run: bool = False, refresh: bool = False,
 
         documents: list[DocumentSpec] = []
         failures = list(inventory["discovery_errors"])
-        for count, item in enumerate(inventory["documents"], 1):
+
+        def acquire_item(item: dict):
             if shutil.disk_usage(root).free < 4 * 1024 ** 3:
-                failures.append({"stage": "storage", "error": "less than 4 GiB free; build stopped"})
-                break
+                return None, {"spec": item["spec"], "stage": "storage",
+                              "error": "less than 4 GiB free; document was not acquired"}
             saved = _resume_source(run, item)
             if saved is not None:
-                documents.append(saved)
-            else:
-                try:
-                    documents.append(_acquire(run, item, fetch))
-                except (ValueError, OSError, RuntimeError) as error:
-                    failures.append({"spec": item["spec"], "stage": "download_or_extract", "error": str(error)})
-            if count % 25 == 0:
-                _write_json(run / "progress.json", {"selected_count": inventory["selected_count"],
-                    "processed_count": count, "downloaded_count": len(documents), "failures": failures})
-                print(f"Acquired {count}/{inventory['selected_count']} Release {config.release} documents", file=sys.stderr)
+                return saved, None
+            try:
+                return _acquire(run, item, fetch), None
+            except (ValueError, OSError, RuntimeError) as error:
+                return None, {"spec": item["spec"], "stage": "download_or_extract", "error": str(error)}
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(acquire_item, item) for item in inventory["documents"]]
+            for count, future in enumerate(as_completed(futures), 1):
+                document, error = future.result()
+                if document is not None:
+                    documents.append(document)
+                if error is not None:
+                    failures.append(error)
+                if count % 25 == 0:
+                    _write_json(run / "progress.json", {"selected_count": inventory["selected_count"],
+                        "processed_count": count, "downloaded_count": len(documents), "failures": failures})
+                    print(f"Acquired {count}/{inventory['selected_count']} Release {config.release} documents", file=sys.stderr)
+        documents.sort(key=lambda item: item.spec)
 
         baseline = None
         ingestion = None
