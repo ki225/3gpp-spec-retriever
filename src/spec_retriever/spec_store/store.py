@@ -127,6 +127,63 @@ class Corpus:
                         self.connection.execute("INSERT INTO chunks_fts VALUES (?,?)", (chunk["search_text"], chunk_id))
         return self.status(manifest.baseline)
 
+    def ingest_resumable(self, manifest: Manifest) -> dict:
+        """Commit documents one at a time so a large build can resume safely."""
+        existing = self.connection.execute("SELECT digest FROM baselines WHERE name=?", (manifest.baseline,)).fetchone()
+        if existing and existing["digest"] != manifest.digest:
+            raise ValueError("baseline already pins different manifest contents; choose a new baseline name")
+        with self.connection:
+            self.connection.execute("INSERT OR IGNORE INTO baselines VALUES (?,?,?,?)",
+                                    (manifest.baseline, manifest.release, manifest.digest, _json(manifest.payload())))
+        for item in manifest.documents:
+            if item.sha256 is None:
+                raise ValueError("ingest requires a locked manifest")
+            document_id = _id(manifest.baseline, item.spec, item.version)
+            path = manifest.document_path(item)
+            status, error, result = "indexed", None, None
+            try:
+                if sha256_file(path) != item.sha256:
+                    status, error = "checksum_mismatch", "source bytes do not match lockfile"
+                else:
+                    previous = self.connection.execute("SELECT status,sha256 FROM documents WHERE id=?",
+                                                       (document_id,)).fetchone()
+                    if previous and previous["status"] == "indexed" and previous["sha256"] == item.sha256:
+                        count = self.connection.execute("SELECT count(*) FROM clauses WHERE document_id=?",
+                                                        (document_id,)).fetchone()[0]
+                        if count:
+                            continue
+                    result = parse_docx(path, item)
+                    if not result.clauses:
+                        status, error, result = "parse_failed", "parser produced no clauses", None
+            except FileNotFoundError:
+                status, error = "missing", "source DOCX does not exist"
+            except Exception as exception:
+                status, error = "parse_failed", f"{type(exception).__name__}: {exception}"
+            with self.connection:
+                self.connection.execute("""DELETE FROM chunks_fts WHERE chunk_id IN (
+                    SELECT k.id FROM chunks k JOIN clauses c ON c.id=k.clause_pk
+                    WHERE c.document_id=?)""", (document_id,))
+                self.connection.execute("DELETE FROM chunks WHERE clause_pk IN (SELECT id FROM clauses WHERE document_id=?)",
+                                        (document_id,))
+                self.connection.execute("DELETE FROM clauses WHERE document_id=?", (document_id,))
+                self.connection.execute("DELETE FROM documents WHERE id=?", (document_id,))
+                warnings = result.warnings if result else []
+                self.connection.execute("INSERT INTO documents VALUES (?,?,?,?,?,?,?,?,?,?)", (
+                    document_id, manifest.baseline, item.spec, item.version, item.source_url,
+                    Path(item.path).name, item.sha256, status, error, _json(warnings)))
+                if result is None:
+                    continue
+                for clause in result.clauses:
+                    clause_pk = _id(document_id, clause.clause_id)
+                    metadata = {name: getattr(clause, name) for name in ("title", "title_path", "annex_type")}
+                    self.connection.execute("INSERT INTO clauses VALUES (?,?,?,?,?,?)", (
+                        clause_pk, document_id, clause.clause_id, clause.ordinal, _json(asdict(clause)), _json(metadata)))
+                    for index, chunk in enumerate(make_chunks(clause)):
+                        chunk_id = _id(clause_pk, str(index))
+                        self.connection.execute("INSERT INTO chunks VALUES (?,?,?)", (chunk_id, clause_pk, _json(chunk)))
+                        self.connection.execute("INSERT INTO chunks_fts VALUES (?,?)", (chunk["search_text"], chunk_id))
+        return self.status(manifest.baseline)
+
     def status(self, baseline: str) -> dict:
         row = self.connection.execute("SELECT * FROM baselines WHERE name=?", (baseline,)).fetchone()
         if row is None:
@@ -138,7 +195,9 @@ class Corpus:
             del item["id"]
             item["clause_count"] = self.connection.execute("SELECT count(*) FROM clauses WHERE document_id=?", (document["id"],)).fetchone()[0]
             documents.append(item)
-        ready = bool(documents) and all(item["status"] == "indexed" for item in documents)
+        expected_count = len(json.loads(row["manifest"])["documents"])
+        ready = (bool(documents) and len(documents) == expected_count
+                 and all(item["status"] == "indexed" for item in documents))
         return {
             "baseline": baseline, "release": row["release"], "manifest_sha256": row["digest"],
             "ingestion_complete": ready,

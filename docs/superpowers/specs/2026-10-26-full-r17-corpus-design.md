@@ -1,6 +1,6 @@
 # Full Release 17 corpus build
 
-Status: proposed design; implementation pending.
+Status: approved design; implementation in progress.
 
 ## Goal and scope
 

@@ -34,7 +34,35 @@ python -m pip install -e ".[mcp]"
 
 On Linux/macOS, activate with `source .venv/bin/activate` instead.
 
-### 2. Index documents
+### 2. Build the full Release 17 corpus
+
+Create `%APPDATA%/3gpp-spec-retriever/config.yaml` on Windows, or
+`~/.config/3gpp-spec-retriever/config.yaml` on Linux/macOS:
+
+```yaml
+release: 17
+scope: all
+storage_root: /absolute/path/to/3gpp-data
+retrieval: sqlite
+```
+
+`scope: all` scans every official archive series and selects the latest `17.x.y`
+version of each specification, including TS and TR. Documents without a Release
+17 archive version are excluded and reported. The build requires Node.js 18+;
+legacy `.doc` sources require LibreOffice or Microsoft Word on Windows.
+
+```powershell
+python -m spec_retriever build --dry-run  # inspect the official inventory
+python -m spec_retriever build            # download, index, and publish
+```
+
+An interrupted build resumes its pinned inventory. Inspect `pending.json` and
+the run's `report.json` under `storage_root` for failures. Only a complete build
+updates `current.json`; until then, the previous published corpus remains active.
+For the configured corpus, start the MCP server with
+`python -m spec_retriever serve` and pass `baseline: "current"` to its tools.
+
+### 3. Index selected documents (optional)
 
 Download and extract an official DOCX. For example, save the document from the
 [TS 29.531 V17.12.0 archive](https://www.3gpp.org/ftp/specs/archive/29_series/29.531/29531-hc0.zip)
@@ -63,7 +91,7 @@ python -m spec_retriever lock data/manifest.json --output data/baseline.lock.jso
 python -m spec_retriever ingest data/baseline.lock.json --db data/corpus.sqlite3
 ```
 
-### 3. Retrieve evidence
+### 4. Retrieve evidence
 
 ```powershell
 # Check corpus availability and parsing warnings.
@@ -80,16 +108,17 @@ python -m spec_retriever scan --db data/corpus.sqlite3 --baseline r17 --term NSS
 
 Search and reference expansion have limits. Inspect reported gaps and pagination before drawing conclusions; the tool does not guarantee that every applicable requirement has been found.
 
-### 4. Connect an agent
+### 5. Connect an agent
 
-Configure your MCP client with the virtual environment's absolute Python path and your database path:
+Configure your MCP client with the virtual environment's absolute Python path.
+The server reads the user-level YAML configuration and its published database:
 
 ```json
 {
   "mcpServers": {
     "3gpp-spec-retriever": {
       "command": "/absolute/path/to/.venv/bin/python",
-      "args": ["-m", "spec_retriever", "serve", "--db", "/absolute/path/to/data/corpus.sqlite3"]
+      "args": ["-m", "spec_retriever", "serve"]
     }
   }
 }
@@ -97,11 +126,11 @@ Configure your MCP client with the virtual environment's absolute Python path an
 
 On Windows, use the absolute path to `.venv/Scripts/python.exe`.
 
-The server exposes seven read-only tools: `search_specs`, `get_clause`, `get_corpus_status`, `list_clauses`, `expand_references`, `collect_evidence`, and `scan_corpus`. Pass the baseline name, such as `r17`, when querying.
+The server exposes seven read-only tools: `search_specs`, `get_clause`, `get_corpus_status`, `list_clauses`, `expand_references`, `collect_evidence`, and `scan_corpus`. Pass `baseline: "current"` to use the published corpus. For an independently indexed database, pass `--db /absolute/path/to/corpus.sqlite3` to `serve` and use its explicit baseline name.
 
 See the [agent skill](skills/3gpp-spec-retriever/SKILL.md) for the evidence collection workflow.
 
-### 5. Check and update documents
+### 6. Check and update documents
 
 Official archive access requires Node.js 18+. Check versions, local files, index status, and missing references:
 
@@ -124,7 +153,7 @@ python -m spec_retriever search "NssaiAvailabilityInfo" --db data/corpus.sqlite3
 
 Use `--required-spec` for expected documents, `--include-references` to select undated or same-Release references, and `--series` to compare an official series. Explicit version references remain pinned.
 
-### 6. Repair a failed DOCX import
+### 7. Repair a failed DOCX import
 
 When `ingest` reports `parse_failed`, the optional repair agent can reproduce the error in an isolated Git worktree, patch the parser, re-import the complete locked manifest, and request an independent read-only review. It opens a PR only after all checks pass. Install and authenticate the Codex and GitHub CLIs first:
 

@@ -40,8 +40,14 @@ def parser() -> argparse.ArgumentParser:
     status.add_argument("--db", required=True)
     status.add_argument("--baseline", required=True)
     serve = commands.add_parser("serve", help="serve read-only MCP tools over stdio")
-    serve.add_argument("--db", required=True)
-    serve.add_argument("--backend", choices=["sqlite", "elastic"], default="sqlite")
+    serve.add_argument("--db")
+    serve.add_argument("--config", help="user-level YAML config; uses the default path if --db is omitted")
+    serve.add_argument("--backend", choices=["sqlite", "elastic"])
+    build = commands.add_parser("build", help="discover and build all official documents in a Release")
+    build.add_argument("--config", help="user-level YAML config; defaults to the platform config directory")
+    build.add_argument("--dry-run", action="store_true", help="list selected official versions without downloading")
+    build.add_argument("--refresh", action="store_true", help="start a new inventory snapshot instead of resuming")
+    build.add_argument("--workers", type=int, default=6)
     sync = commands.add_parser("sync-elastic", help="publish an Elasticsearch/BGE-M3 snapshot")
     sync.add_argument("--db", required=True)
     sync.add_argument("--baseline", required=True)
@@ -178,11 +184,26 @@ def main(argv: list[str] | None = None) -> int:
                                  review_model=args.review_model, max_attempts=args.max_attempts,
                                  publish_pr=not args.no_pr, timeout=args.timeout,
                                  validator_image=args.validator_image)
+        elif args.command == "build":
+            from spec_retriever.config import load_config
+            from spec_retriever.sync.batch import build
+
+            if not 1 <= args.workers <= 16:
+                raise ValueError("workers must be between 1 and 16")
+            result = build(load_config(args.config), dry_run=args.dry_run,
+                           refresh=args.refresh, workers=args.workers)
         elif args.command == "serve":
             from .mcp_server import create_server
+            from spec_retriever.config import load_config
 
-            create_server(args.db, backend=args.backend, model=args.model, device=args.device,
-                          prefix=args.index_prefix, rerank=args.rerank).run(transport="stdio")
+            config = load_config(args.config) if args.config or not args.db else None
+            database = args.db or config.database
+            if config and not config.active_pointer.is_file():
+                raise ValueError("configured corpus has no published current.json; run build first")
+
+            create_server(database, backend=args.backend or (config.retrieval if config else "sqlite"),
+                          model=args.model, device=args.device, prefix=args.index_prefix,
+                          rerank=args.rerank, active_pointer=config.active_pointer if config else None).run(transport="stdio")
             return 0
         else:
             with Corpus(args.db) as corpus:
@@ -281,7 +302,9 @@ def main(argv: list[str] | None = None) -> int:
             displayed.update(output=args.output, missing_reference_count=len(result.get("missing_references", [])),
                              missing_reference_specs=sorted({row["spec"] for row in result.get("missing_references", [])}))
         print(json.dumps(displayed, ensure_ascii=False, indent=2))
-        return 2 if ((args.command == "ingest" and not result["ingestion_complete"])
+        return 2 if ((args.command == "build" and ((args.dry_run and result["discovery_errors"])
+                      or (not args.dry_run and not result["complete"])))
+                     or (args.command == "ingest" and not result["ingestion_complete"])
                      or (args.command == "heal-import" and result["status"] not in
                          {"pr_created", "validated", "no_parse_failure"})
                      or (args.command == "check-documents" and (not result["all_selected_current"] or result["missing_references"]))

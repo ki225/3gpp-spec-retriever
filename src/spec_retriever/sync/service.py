@@ -10,8 +10,10 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from uuid import uuid4
 import zipfile
 
@@ -128,10 +130,10 @@ def check_documents(corpus, manifest: Manifest, *, catalog=None, required_specs=
                                "include_references": include_references, "global_3gpp_completeness": "not_assessed"}}
 
 
-def extract_document(archive: bytes, spec: str, destination: Path) -> tuple[Path, dict]:
+def extract_document(archive: bytes | Path, spec: str, destination: Path) -> tuple[Path, dict]:
     """Extract exactly one specification document; never extract ZIP paths."""
     try:
-        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+        with zipfile.ZipFile(archive if isinstance(archive, Path) else io.BytesIO(archive)) as bundle:
             prefix = spec.replace('.', '') + '-'
             candidates = [item for item in bundle.infolist()
                           if PurePosixPath(item.filename).name.lower().startswith(prefix)
@@ -140,25 +142,38 @@ def extract_document(archive: bytes, spec: str, destination: Path) -> tuple[Path
             if len(candidates) != 1:
                 raise ValueError(f"{spec}: expected exactly one specification DOC/DOCX, got {len(candidates)}")
             entry = candidates[0]
-            if entry.file_size > 128 * 1024 * 1024:
-                raise ValueError("uncompressed document exceeds 128 MiB")
+            if entry.file_size > 512 * 1024 * 1024:
+                raise ValueError("uncompressed document exceeds 512 MiB")
             data = bundle.read(entry)
             target = destination / ("source" + PurePosixPath(entry.filename).suffix.lower())
             with target.open("xb") as stream:
                 stream.write(data)
     except zipfile.BadZipFile as error:
         raise ValueError(f"{spec}: invalid official ZIP") from error
-    return target, {"archive_sha256": hashlib.sha256(archive).hexdigest(),
+    archive_hash = sha256_file(archive) if isinstance(archive, Path) else hashlib.sha256(archive).hexdigest()
+    return target, {"archive_sha256": archive_hash,
                     "archive_member": entry.filename, "original_sha256": hashlib.sha256(data).hexdigest()}
 
 
 def convert_legacy_doc(source: Path) -> Path:
-    """Windows Word conversion of our downloaded file in a separate hidden instance."""
-    if sys.platform != "win32":
-        raise ValueError("legacy DOC requires Windows Word conversion; active corpus was not changed")
+    """Convert an official legacy DOC with LibreOffice or Windows Word."""
     output = source.with_suffix('.docx')
     if output.exists():
         raise ValueError("conversion destination already exists")
+    libreoffice = shutil.which("libreoffice") or shutil.which("soffice")
+    if libreoffice:
+        with tempfile.TemporaryDirectory() as profile:
+            try:
+                completed = subprocess.run([libreoffice, "-env:UserInstallation=" + Path(profile).as_uri(),
+                    "--headless", "--convert-to", "docx", "--outdir", str(source.parent), str(source)],
+                    capture_output=True, timeout=180)
+            except subprocess.TimeoutExpired as error:
+                raise ValueError("legacy DOC conversion timed out") from error
+        if completed.returncode or not output.is_file():
+            raise ValueError("legacy DOC conversion failed; active corpus was not changed")
+        return output
+    if sys.platform != "win32":
+        raise ValueError("legacy DOC requires LibreOffice; active corpus was not changed")
     quote = lambda path: "'" + str(path.resolve()).replace("'", "''") + "'"
     script = f"""$ErrorActionPreference='Stop'; $word=$null; $doc=$null
 try {{
@@ -172,8 +187,11 @@ try {{
 }}
 """
     encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
-    completed = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
-                               capture_output=True, timeout=180)
+    try:
+        completed = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+                                   capture_output=True, timeout=180)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("legacy DOC conversion timed out") from error
     if completed.returncode or not output.is_file():
         raise ValueError("legacy DOC conversion failed; active corpus was not changed")
     return output

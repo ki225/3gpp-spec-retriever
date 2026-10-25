@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
+from pathlib import Path
 import re
 import subprocess
 from urllib.parse import unquote, urljoin, urlparse
@@ -37,6 +38,39 @@ for (let hops=0; hops<5; hops++) {
 if (!finished) throw new Error('Too many redirects');
 """
 
+DOWNLOAD_JS = r"""
+import {open} from 'node:fs/promises';
+let u = process.argv[1];
+const target = process.argv[2];
+const valid = s => { const x = new URL(s); return x.protocol === 'https:' &&
+  x.hostname === 'www.3gpp.org' && !x.port && !x.username && !x.password &&
+  !x.search && !x.hash && x.pathname.startsWith('/ftp/specs/archive/'); };
+let finished = false;
+for (let hops=0; hops<5; hops++) {
+  if (!valid(u)) throw new Error('Non-official archive URL');
+  const r = await fetch(u, {redirect:'manual', signal:AbortSignal.timeout(300000)});
+  if ([301,302,303,307,308].includes(r.status)) {
+    const loc = r.headers.get('location'); if (!loc) throw new Error('Missing redirect');
+    u = new URL(loc,u).href; continue;
+  }
+  if (!r.ok) throw new Error('HTTP '+r.status);
+  const file = await open(target, 'wx');
+  try {
+    let n=0;
+    for await (const b of r.body) {
+      n+=b.length; if(n>536870912) throw new Error('Download exceeds 512 MiB');
+      for (let offset=0; offset<b.length;) {
+        const written = await file.write(b, offset, b.length-offset);
+        offset += written.bytesWritten;
+      }
+    }
+    await file.sync();
+  } finally { await file.close(); }
+  finished = true; break;
+}
+if (!finished) throw new Error('Too many redirects');
+"""
+
 
 def official_url(url: str) -> str:
     parsed = urlparse(url)
@@ -62,6 +96,22 @@ def fetch_bytes(url: str) -> bytes:
     if len(result.stdout) > MAX_BYTES:
         raise ValueError("download exceeds 64 MiB")
     return result.stdout
+
+
+def download_archive(url: str, target: Path) -> None:
+    """Stream an official ZIP to a new file without buffering it in memory."""
+    official_url(url)
+    try:
+        result = subprocess.run(["node", "--input-type=module", "-e", DOWNLOAD_JS, url, str(target)],
+                                capture_output=True, timeout=330)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        target.unlink(missing_ok=True)
+        raise ValueError(f"official download requires Node.js >=18: {error}") from error
+    if result.returncode:
+        target.unlink(missing_ok=True)
+        message = result.stderr.decode("utf-8", errors="replace")
+        status = re.search(r"HTTP \d{3}", message)
+        raise ValueError(f"official download failed: {url} ({status[0] if status else 'transport error'})")
 
 
 class Links(HTMLParser):
@@ -104,15 +154,19 @@ class OfficialCatalog:
             directory = spec_directory(spec)
             pattern = re.compile(re.escape(spec.replace(".", "")) + r"-([0-9a-z])([0-9a-z])([0-9a-z])\.zip", re.I)
             found = {}
+            document_files = []
             for href in links_in(self.fetch(directory)):
                 url = urljoin(directory, href)
                 if urlparse(url).path.rsplit("/", 1)[0] + "/" != urlparse(directory).path:
                     continue
-                match = pattern.fullmatch(urlparse(url).path.rsplit("/", 1)[-1])
+                filename = urlparse(url).path.rsplit("/", 1)[-1]
+                if filename.lower().endswith((".zip", ".doc", ".docx")):
+                    document_files.append(filename)
+                match = pattern.fullmatch(filename)
                 if match:
                     version = ".".join(str(int(part, 36)) for part in match.groups())
                     found[version] = Archive(spec, version, official_url(url))
-            if not found:
+            if not found and document_files:
                 raise ValueError(f"no canonical archive entries found for {spec}")
             self._archives[spec] = list(found.values())
         return self._archives[spec]
@@ -121,17 +175,32 @@ class OfficialCatalog:
         candidates = [item for item in self.archives(spec) if int(item.version.split('.')[0]) == release]
         return max(candidates, key=lambda item: tuple(map(int, item.version.split('.'))), default=None)
 
-    def series_specs(self, series: str) -> list[str]:
+    def series(self) -> list[str]:
+        """Discover all numbered archive series from the official root."""
+        root_path = urlparse(ROOT).path.rstrip("/")
+        found = set()
+        for href in links_in(self.fetch(ROOT)):
+            url = urljoin(ROOT, href)
+            path = urlparse(url).path.rstrip("/")
+            match = re.fullmatch(re.escape(root_path) + r"/(\d{2,3})_series", path)
+            if match:
+                official_url(url)
+                found.add(match[1])
+        if not found:
+            raise ValueError("no numbered series found in the official archive")
+        return sorted(found)
+
+    def series_specs(self, series: str, *, allow_empty: bool = False) -> list[str]:
         if not re.fullmatch(r"\d{2,3}", series):
             raise ValueError("series must be two or three digits")
         directory = f"{ROOT}{series}_series/"
         found = set()
         for href in links_in(self.fetch(directory)):
             url = urljoin(directory, href)
-            match = re.fullmatch(re.escape(urlparse(directory).path) + r"(\d{2,3}\.\d{3}(?:-\d+)?)/", urlparse(url).path)
+            match = re.fullmatch(re.escape(urlparse(directory).path) + r"(\d{2,3}\.\d{3}(?:-\d+)?)/?", urlparse(url).path)
             if match and match[1].startswith(series):
                 official_url(url)
                 found.add(match[1])
-        if not found:
+        if not found and not allow_empty:
             raise ValueError(f"no specification directories found for series {series}")
         return sorted(found)

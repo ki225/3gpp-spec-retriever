@@ -9,7 +9,8 @@ from spec_retriever.retrieval.service import multi_search, expand_references as 
 
 
 def create_server(database: str | Path, *, backend: str = "sqlite", model: str = "BAAI/bge-m3",
-                  device: str = "cpu", prefix: str = "3gpp-specs", rerank: bool = False):
+                  device: str = "cpu", prefix: str = "3gpp-specs", rerank: bool = False,
+                  active_pointer: str | Path | None = None):
     try:
         from mcp.server.fastmcp import FastMCP
     except ImportError as error:
@@ -27,6 +28,17 @@ def create_server(database: str | Path, *, backend: str = "sqlite", model: str =
             raise ValueError("install the 'elastic' extra for hybrid MCP retrieval") from error
     state = {}
     model_lock, inference_lock = Lock(), Lock()
+
+    def resolve_baseline(baseline: str) -> str:
+        if baseline != "current":
+            return baseline
+        if active_pointer is None:
+            raise ValueError("current requires a configured active corpus pointer")
+        import json
+        pointer = json.loads(Path(active_pointer).read_text(encoding="utf-8"))
+        if not pointer.get("complete") or Path(pointer["database"]).resolve() != Path(database).resolve():
+            raise ValueError("active corpus pointer is incomplete or belongs to a different database")
+        return pointer["baseline"]
 
     def elastic_backend():
         from spec_retriever.retrieval.elastic import BGEEmbedder, ElasticBackend, create_client
@@ -54,6 +66,7 @@ def create_server(database: str | Path, *, backend: str = "sqlite", model: str =
                            subqueries: list[str] | None = None) -> dict:
         """Search indexed text; inspect corpus_status and truncated before drawing conclusions."""
         from anyio import to_thread
+        baseline = resolve_baseline(baseline)
 
         def operation():
             with Corpus(database) as corpus:
@@ -68,6 +81,7 @@ def create_server(database: str | Path, *, backend: str = "sqlite", model: str =
         """Scan all supported blocks, then paginate. Follow next_offset; matches require relevance review."""
         from anyio import to_thread
         from spec_retriever.workflows.audit import scan_corpus as scan
+        baseline = resolve_baseline(baseline)
 
         def operation():
             with Corpus(database) as corpus:
@@ -79,18 +93,38 @@ def create_server(database: str | Path, *, backend: str = "sqlite", model: str =
     def get_clause(baseline: str, spec: str, version: str, clause: str,
                    include_children: bool = False) -> dict:
         """Read an exact versioned clause, including ordered tables and source XML locations."""
+        baseline = resolve_baseline(baseline)
         with Corpus(database) as corpus:
             return corpus.get_clause(baseline, spec, version, clause, include_children=include_children)
 
     @server.tool()
     def get_corpus_status(baseline: str) -> dict:
         """Report manifest import failures and unsupported content; coverage is not assessed."""
+        requested = baseline
+        baseline = resolve_baseline(baseline)
         with Corpus(database) as corpus:
-            return corpus.status(baseline)
+            result = corpus.status(baseline)
+        if requested == "current" and active_pointer is not None:
+            import json
+            pointer = json.loads(Path(active_pointer).read_text(encoding="utf-8"))
+            result["build_scope"] = pointer.get("scope")
+            result["selected_count"] = pointer.get("selected_count")
+            result["indexed_count"] = pointer.get("indexed_count")
+            result["build_complete"] = pointer.get("complete", False)
+            pending = Path(active_pointer).with_name("pending.json")
+            if pending.is_file():
+                run = Path(json.loads(pending.read_text(encoding="utf-8"))["run"])
+                report = run / "report.json"
+                if report.is_file():
+                    current_build = json.loads(report.read_text(encoding="utf-8"))
+                    result["pending_build"] = {key: current_build[key] for key in
+                        ("run", "selected_count", "downloaded_count", "indexed_count", "failures", "complete")}
+        return result
 
     @server.tool()
     def list_clauses(baseline: str, spec: str, version: str, offset: int = 0, limit: int = 100) -> dict:
         """Navigate pinned document headings; next_offset permits explicit pagination."""
+        baseline = resolve_baseline(baseline)
         with Corpus(database) as corpus:
             return corpus.list_clauses(baseline, spec, version, offset=offset, limit=limit)
 
@@ -98,6 +132,7 @@ def create_server(database: str | Path, *, backend: str = "sqlite", model: str =
     def expand_references(baseline: str, seeds: list[dict[str, str]], dependencies: list[str] | None = None,
                           max_depth: int = 2, max_nodes: int = 40, max_chars: int = 200000) -> dict:
         """Follow exact pinned references; inspect unresolved, pending and truncated."""
+        baseline = resolve_baseline(baseline)
         with Corpus(database) as corpus:
             return expand_graph(corpus, baseline, seeds, dependencies=dependencies, max_depth=max_depth,
                                 max_nodes=max_nodes, max_chars=max_chars)
@@ -108,6 +143,7 @@ def create_server(database: str | Path, *, backend: str = "sqlite", model: str =
                          max_depth: int = 2, max_nodes: int = 60, max_chars: int = 200000) -> dict:
         """Collect search hits, full clauses, context and reference graph within explicit budgets."""
         from anyio import to_thread
+        baseline = resolve_baseline(baseline)
 
         def operation():
             with Corpus(database) as corpus:
