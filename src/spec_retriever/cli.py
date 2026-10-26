@@ -21,6 +21,15 @@ def parser() -> argparse.ArgumentParser:
     ingest = commands.add_parser("ingest", help="index a locked corpus baseline")
     ingest.add_argument("manifest")
     ingest.add_argument("--db", required=True)
+    reference_index = commands.add_parser("index-references", help="build resumable version-pinned citation edges")
+    reference_index.add_argument("--db", required=True)
+    reference_index.add_argument("--baseline", required=True)
+    references = commands.add_parser("references", help="inspect incoming and outgoing clause references")
+    for flag in ("db", "baseline", "spec", "version", "clause"):
+        references.add_argument("--" + flag, required=True)
+    references.add_argument("--direction", choices=["outgoing", "incoming", "both"], default="both")
+    references.add_argument("--offset", type=int, default=0)
+    references.add_argument("--limit", type=int, default=100)
     search = commands.add_parser("search", help="search with provenance and import limitations")
     search.add_argument("query")
     search.add_argument("--db", required=True)
@@ -40,8 +49,14 @@ def parser() -> argparse.ArgumentParser:
     status.add_argument("--db", required=True)
     status.add_argument("--baseline", required=True)
     serve = commands.add_parser("serve", help="serve read-only MCP tools over stdio")
-    serve.add_argument("--db", required=True)
-    serve.add_argument("--backend", choices=["sqlite", "elastic"], default="sqlite")
+    serve.add_argument("--db")
+    serve.add_argument("--config", help="user-level YAML config; uses the default path if --db is omitted")
+    serve.add_argument("--backend", choices=["sqlite", "elastic"])
+    build = commands.add_parser("build", help="discover and build all official documents in a Release")
+    build.add_argument("--config", help="user-level YAML config; defaults to the platform config directory")
+    build.add_argument("--dry-run", action="store_true", help="list selected official versions without downloading")
+    build.add_argument("--refresh", action="store_true", help="start a new inventory snapshot instead of resuming")
+    build.add_argument("--workers", type=int, default=6)
     sync = commands.add_parser("sync-elastic", help="publish an Elasticsearch/BGE-M3 snapshot")
     sync.add_argument("--db", required=True)
     sync.add_argument("--baseline", required=True)
@@ -148,6 +163,8 @@ def _run_query(corpus, args, search_fn=None):
 
 
 def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     args = parser().parse_args(argv)
     try:
         from pathlib import Path
@@ -178,11 +195,26 @@ def main(argv: list[str] | None = None) -> int:
                                  review_model=args.review_model, max_attempts=args.max_attempts,
                                  publish_pr=not args.no_pr, timeout=args.timeout,
                                  validator_image=args.validator_image)
+        elif args.command == "build":
+            from spec_retriever.config import load_config
+            from spec_retriever.sync.batch import build
+
+            if not 1 <= args.workers <= 16:
+                raise ValueError("workers must be between 1 and 16")
+            result = build(load_config(args.config), dry_run=args.dry_run,
+                           refresh=args.refresh, workers=args.workers)
         elif args.command == "serve":
             from .mcp_server import create_server
+            from spec_retriever.config import load_config
 
-            create_server(args.db, backend=args.backend, model=args.model, device=args.device,
-                          prefix=args.index_prefix, rerank=args.rerank).run(transport="stdio")
+            config = load_config(args.config) if args.config or not args.db else None
+            database = args.db or config.database
+            if config and not config.active_pointer.is_file():
+                raise ValueError("configured corpus has no published current.json; run build first")
+
+            create_server(database, backend=args.backend or (config.retrieval if config else "sqlite"),
+                          model=args.model, device=args.device, prefix=args.index_prefix,
+                          rerank=args.rerank, active_pointer=config.active_pointer if config else None).run(transport="stdio")
             return 0
         else:
             with Corpus(args.db) as corpus:
@@ -226,6 +258,16 @@ def main(argv: list[str] | None = None) -> int:
                             json.dump(result, stream, ensure_ascii=False, indent=2)
                 elif args.command == "ingest":
                     result = corpus.ingest(load_manifest(args.manifest))
+                elif args.command == "index-references":
+                    from spec_retriever.retrieval.reference_index import build_reference_index
+
+                    result = build_reference_index(corpus, args.baseline, progress=True)
+                elif args.command == "references":
+                    from spec_retriever.retrieval.reference_index import references_for_clause
+
+                    result = references_for_clause(corpus, {key: getattr(args, key) for key in
+                        ("baseline", "spec", "version", "clause")}, direction=args.direction,
+                        offset=args.offset, limit=args.limit)
                 elif args.command == "status":
                     result = corpus.status(args.baseline)
                 elif args.command == "scan":
@@ -281,7 +323,9 @@ def main(argv: list[str] | None = None) -> int:
             displayed.update(output=args.output, missing_reference_count=len(result.get("missing_references", [])),
                              missing_reference_specs=sorted({row["spec"] for row in result.get("missing_references", [])}))
         print(json.dumps(displayed, ensure_ascii=False, indent=2))
-        return 2 if ((args.command == "ingest" and not result["ingestion_complete"])
+        return 2 if ((args.command == "build" and ((args.dry_run and result["discovery_errors"])
+                      or (not args.dry_run and not result["complete"])))
+                     or (args.command == "ingest" and not result["ingestion_complete"])
                      or (args.command == "heal-import" and result["status"] not in
                          {"pr_created", "validated", "no_parse_failure"})
                      or (args.command == "check-documents" and (not result["all_selected_current"] or result["missing_references"]))

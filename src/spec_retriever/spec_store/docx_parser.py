@@ -237,18 +237,32 @@ def parse_docx(path: Path, expected: DocumentSpec) -> ParsedDocument:
             break
     cover_identities = set(IDENTITY.findall("\n".join(cover)))
     header_footer = []
-    for section in document.sections:
-        header_footer.extend(paragraph.text for paragraph in section.header.paragraphs)
-        header_footer.extend(paragraph.text for paragraph in section.footer.paragraphs)
+    for section_index, section in enumerate(document.sections):
+        for part_name in ("header", "footer"):
+            try:
+                part = getattr(section, part_name)
+                header_footer.extend(paragraph.text for paragraph in part.paragraphs)
+            except (AttributeError, KeyError) as error:
+                # Some official DOCX packages point a section header relation
+                # at an image. The specification body remains parseable.
+                warnings.append({"code": "section_header_footer_unavailable",
+                                 "section": section_index, "part": part_name,
+                                 "message": f"{type(error).__name__}: {error}"})
     header_identities = set(IDENTITY.findall("\n".join(header_footer)))
     # STYLEREF/revision fields can concatenate current and previous header
     # versions. The explicit cover is authoritative when it identifies a spec.
-    identities = cover_identities or header_identities
     if cover_identities and header_identities - cover_identities:
         warnings.append({"code": "header_identity_differs_from_cover", "message": "cover identity used; header fields require review"})
-    if identities:
-        if identities != {(expected.spec, expected.version)}:
-            raise ValueError(f"document identity {sorted(identities)} differs from manifest {expected.spec} {expected.version}")
+    if cover_identities:
+        if cover_identities != {(expected.spec, expected.version)}:
+            raise ValueError(f"document identity {sorted(cover_identities)} differs from manifest {expected.spec} {expected.version}")
+    elif header_identities:
+        if any(spec != expected.spec for spec, _ in header_identities):
+            raise ValueError(f"header specification {sorted(header_identities)} differs from manifest {expected.spec}")
+        if header_identities != {(expected.spec, expected.version)}:
+            warnings.append({"code": "header_version_differs_from_manifest",
+                             "header_identities": sorted(header_identities),
+                             "message": "header revision fields may concatenate values; official archive version used"})
     else:
         warnings.append({"code": "document_identity_not_detected", "message": "identity relies on manifest metadata and checksum"})
 
@@ -301,7 +315,16 @@ def parse_docx(path: Path, expected: DocumentSpec) -> ParsedDocument:
                                      "first_location": current.blocks[0]["location"],
                                      "duplicate_location": location})
                     continue
-                raise ValueError(f"duplicate clause ID {clause_id}; numbering needs review")
+                printed_id = clause_id
+                occurrence = 2
+                while f"{printed_id}~{occurrence}" in seen:
+                    occurrence += 1
+                clause_id = f"{printed_id}~{occurrence}"
+                warnings.append({"code": "duplicate_printed_clause_id",
+                                 "printed_clause_id": printed_id,
+                                 "resolved_clause_id": clause_id,
+                                 "location": location,
+                                 "message": "distinct source headings share a printed number; both are retained"})
             seen.add(clause_id)
             level = level or clause_id.count(".") + 1
             while stack and stack[-1][0] >= level:

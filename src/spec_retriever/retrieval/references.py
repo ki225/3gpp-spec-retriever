@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import json
 
 from spec_retriever.spec_store.docx_parser import CLAUSE_NUMBER
 
@@ -167,16 +168,21 @@ class ReferenceResolver:
     def _records(self, baseline: str, spec: str, version: str) -> list[dict]:
         key = (baseline, spec, version)
         if key not in self._documents:
-            self._documents[key] = list(self.corpus.clause_records(*key))
+            rows = self.corpus.connection.execute("""SELECT c.payload FROM clauses c
+                JOIN documents d ON d.id=c.document_id
+                WHERE d.baseline=? AND d.spec=? AND d.version=? ORDER BY c.ordinal""", key)
+            self._documents[key] = [json.loads(row["payload"]) for row in rows]
         return self._documents[key]
 
-    def references_for(self, address: dict, clause: dict) -> list[dict]:
+    def references_for(self, address: dict, clause: dict, *, include_types: bool = True) -> list[dict]:
         records = self._records(address["baseline"], address["spec"], address["version"])
         key = (address["baseline"], address["spec"], address["version"])
         if key not in self._bibliographies:
             self._bibliographies[key] = bibliography(records)
         found = extract_references(clause, source_spec=address["spec"], source_version=address["version"],
                                    references=self._bibliographies[key])
+        if not include_types:
+            return found
         if self._symbols is None:
             self._symbols = {}
             for baseline in self.baselines:
@@ -287,9 +293,16 @@ class ReferenceResolver:
                 return {"status": "unresolved", "reason": "table_owner_not_unique", "candidates": owners}
             clause_id = owners[0]
         target["clause"] = clause_id
-        key = (target["baseline"], spec, target["version"])
-        if key not in self._clause_ids:
-            self._clause_ids[key] = {record["clause_id"] for record in self._records(target["baseline"], spec, target["version"])}
-        if clause_id not in self._clause_ids[key]:
+        document_id = self.corpus.connection.execute(
+            "SELECT id FROM documents WHERE baseline=? AND spec=? AND version=?",
+            (target["baseline"], spec, target["version"])).fetchone()
+        clause_rows = (self.corpus.connection.execute(
+            "SELECT clause_id FROM clauses WHERE document_id=? AND "
+            "(clause_id=? OR substr(clause_id,1,length(?)+1)=? || '~')",
+            (document_id["id"], clause_id, clause_id, clause_id)).fetchall() if document_id else [])
+        if not clause_rows:
             return {"status": "unresolved", "reason": "clause_not_found", "target": target}
+        if len(clause_rows) > 1:
+            return {"status": "unresolved", "reason": "ambiguous_printed_clause_id", "target": target,
+                    "candidates": [row["clause_id"] for row in clause_rows]}
         return {"status": "resolved", "target": target, "version_policy": "exact" if version else "pinned_baseline"}

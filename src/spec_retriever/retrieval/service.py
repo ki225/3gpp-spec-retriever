@@ -6,6 +6,7 @@ from collections import deque
 import re
 
 from spec_retriever.retrieval.references import ReferenceResolver
+from spec_retriever.retrieval.reference_index import index_status, references_for_clause
 
 ACRONYMS = {
     "AMF": "Access and Mobility Management Function", "SMF": "Session Management Function",
@@ -105,7 +106,8 @@ def _validate_budgets(max_depth, max_nodes, max_chars, max_edges=400, neighbours
 
 def expand_references(corpus, baseline: str, seeds: list[dict], *, dependencies: list[str] | None = None,
                       max_depth: int = 2, max_nodes: int = 40, max_chars: int = 200000,
-                      max_edges: int = 400, include_context: bool = False, neighbours: int = 1) -> dict:
+                      max_edges: int = 400, include_context: bool = False, neighbours: int = 1,
+                      include_incoming: bool = False, query: str | None = None) -> dict:
     _validate_budgets(max_depth, max_nodes, max_chars, max_edges, neighbours)
     if not isinstance(seeds, list) or not seeds or len(seeds) > 200:
         raise ValueError("seeds must contain 1-200 clause addresses")
@@ -113,8 +115,11 @@ def expand_references(corpus, baseline: str, seeds: list[dict], *, dependencies:
     addresses = [_address(item, baseline) for item in seeds]
     if any(item["baseline"] not in resolver.baselines for item in addresses):
         raise ValueError("seed baseline must be the primary or an explicit dependency baseline")
+    index_ready = all(index_status(corpus, name)["complete"] for name in resolver.baselines)
     queue, scheduled, visited = deque(), set(), set()
     edges, unresolved, pending, nodes = [], [], [], []
+    if include_incoming and not index_ready:
+        pending.append({"reason": "incoming_references_require_complete_index"})
     chars_used = 0
     truncated = False
     per_node_chars = max(1000, max_chars // min(len(addresses), max_nodes))
@@ -123,7 +128,14 @@ def expand_references(corpus, baseline: str, seeds: list[dict], *, dependencies:
         key = _key(address)
         if key not in scheduled and key not in visited:
             scheduled.add(key)
-            queue.append((address, depth, relationship))
+            item = (address, depth, relationship)
+            if relationship == "incoming_reference":
+                # Process reverse hits after remaining search seeds, before
+                # broad context and forward hops consume the node budget.
+                remaining_seeds = sum(entry[2] == "seed" for entry in queue)
+                queue.insert(remaining_seeds, item)
+            else:
+                queue.append(item)
 
     for address in addresses:
         enqueue(address, 0, "seed")
@@ -173,34 +185,59 @@ def expand_references(corpus, baseline: str, seeds: list[dict], *, dependencies:
                       "omitted_block_count": len(omitted), "omitted_block_details_truncated": len(omitted) > 50,
                       "descendant_clause_ids": evidence["descendant_clause_ids"],
                       **{name: evidence[name] for name in ("source_url", "filename", "sha256")}})
-        references = resolver.references_for(address, clause)
-        for index, reference in enumerate(references):
+        if index_ready:
+            outgoing = references_for_clause(corpus, address, direction="outgoing", limit=500)
+            indexed_edges = outgoing["edges"]
+            if outgoing["truncated"]:
+                pending.append({"source": address, "reason": "outgoing_reference_limit"})
+                truncated = True
+            if include_incoming and relationship == "seed":
+                incoming = references_for_clause(corpus, address, direction="incoming", limit=100)
+                terms = {part.casefold() for part in re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", query or "")}
+                inbound = incoming["edges"]
+                inbound.sort(key=lambda edge: (-len(terms.intersection(
+                    re.findall(r"[A-Za-z][A-Za-z0-9_]{2,}", edge["source_title"].casefold()))),
+                    edge["source"]["spec"], edge["source"]["clause"]))
+                if incoming["truncated"] or len(inbound) > 4:
+                    pending.append({"source": address, "reason": "incoming_reference_limit",
+                                    "candidate_count": len(inbound), "returned_count": min(4, len(inbound))})
+                    truncated = True
+                indexed_edges += inbound[:4]
+            references = [(edge["reference"], edge["resolution"], edge["direction"], edge["source"])
+                          for edge in indexed_edges]
+        else:
+            references = [(reference, resolver.resolve(reference, address), "outgoing", address)
+                          for reference in resolver.references_for(address, clause)]
+        for index, (reference, resolution, direction, source_address) in enumerate(references):
             if len(edges) >= max_edges:
                 pending.append({"source": address, "reason": "edge_budget", "unprocessed_references": len(references)-index})
                 truncated = True
                 break
-            resolution = resolver.resolve(reference, address)
-            preview = {**reference, "raw": reference["raw"][:800], "raw_excerpt_truncated": len(reference["raw"]) > 800}
-            edge = {"source": address, "reference": preview, **resolution}
+            preview = {**reference, "raw": reference["raw"][:800],
+                       "raw_excerpt_truncated": reference.get("raw_excerpt_truncated", False)
+                                                or len(reference["raw"]) > 800}
+            edge = {"source": source_address, "direction": direction, "reference": preview, **resolution}
             edges.append(edge)
             if resolution["status"] != "resolved":
                 unresolved.append(edge)
                 continue
-            target = resolution["target"]
+            target = source_address if direction == "incoming" else resolution["target"]
             if _key(target) in visited or _key(target) in scheduled:
                 continue
             if depth >= max_depth:
                 pending.append({"source": address, "target": target, "reason": "depth_budget"})
                 truncated = True
             else:
-                enqueue(target, depth+1, "reference")
+                enqueue(target, depth+1, "incoming_reference" if direction == "incoming" else "reference")
     scopes = [corpus.status(name) for name in resolver.baselines]
     limitations = any(not item["ingestion_complete"] or item["has_parser_limitations"] for item in scopes)
     return {"baseline": baseline, "nodes": nodes, "edges": edges, "unresolved": unresolved,
             "pending": pending, "truncated": truncated,
             "has_gaps": bool(unresolved or pending or truncated or limitations),
-            "coverage": "bounded_parsed_references_not_exhaustive_applicability",
-            "parsed_reference_kinds": ["clause", "annex", "table", "specification", "bibliography", "typed_table_cells"],
+            "reference_index": "complete" if index_ready else "unavailable_fallback_to_live_parser",
+            "coverage": "bounded_explicit_references_not_exhaustive_applicability",
+            "parsed_reference_kinds": (["clause", "annex", "table", "specification", "bibliography"]
+                if index_ready else ["clause", "annex", "table", "specification", "bibliography", "typed_table_cells"]),
             "budget": {"max_depth": max_depth, "max_nodes": max_nodes, "max_edges": max_edges,
                        "max_chars": max_chars, "per_node_chars": per_node_chars, "chars_used": chars_used}, "corpus_status": scopes}
 
@@ -214,7 +251,8 @@ def collect_evidence(corpus, query: str, baseline: str, *, subqueries: list[str]
     seeds = [{key: item[key] for key in ("baseline", "spec", "version", "clause")} for item in search["results"]]
     if seeds:
         graph = expand_references(corpus, baseline, seeds, dependencies=dependencies, max_depth=max_depth,
-                                  max_nodes=max_nodes, max_chars=max_chars, include_context=True, neighbours=neighbours)
+                                  max_nodes=max_nodes, max_chars=max_chars, include_context=True, neighbours=neighbours,
+                                  include_incoming=True, query=query)
     else:
         # Still validate explicit scopes even when the search has no hits.
         resolver = ReferenceResolver(corpus, baseline, dependencies)

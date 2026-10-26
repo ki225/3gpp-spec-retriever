@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from datetime import datetime, timezone
 import base64
 import hashlib
@@ -10,10 +11,15 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from uuid import uuid4
 import zipfile
+
+from docx import Document
+from docx.oxml.ns import qn
 
 from spec_retriever.spec_store.manifest import DocumentSpec, Manifest, load_manifest, sha256_file
 from spec_retriever.sync.official import OfficialCatalog, fetch_bytes
@@ -128,37 +134,104 @@ def check_documents(corpus, manifest: Manifest, *, catalog=None, required_specs=
                                "include_references": include_references, "global_3gpp_completeness": "not_assessed"}}
 
 
-def extract_document(archive: bytes, spec: str, destination: Path) -> tuple[Path, dict]:
-    """Extract exactly one specification document; never extract ZIP paths."""
+def extract_document(archive: bytes | Path, spec: str, destination: Path) -> tuple[Path, dict]:
+    """Extract a single document or merge an official section-split bundle."""
     try:
-        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
-            prefix = spec.replace('.', '') + '-'
+        with zipfile.ZipFile(archive if isinstance(archive, Path) else io.BytesIO(archive)) as bundle:
+            stem = spec.replace('.', '')
+            prefixes = (stem + '-', stem + '.')
             candidates = [item for item in bundle.infolist()
-                          if PurePosixPath(item.filename).name.lower().startswith(prefix)
+                          if PurePosixPath(item.filename).name.lower().startswith(prefixes)
                           and PurePosixPath(item.filename).suffix.lower() in {".doc", ".docx"}
                           and not item.is_dir()]
-            if len(candidates) != 1:
-                raise ValueError(f"{spec}: expected exactly one specification DOC/DOCX, got {len(candidates)}")
-            entry = candidates[0]
-            if entry.file_size > 128 * 1024 * 1024:
-                raise ValueError("uncompressed document exceeds 128 MiB")
-            data = bundle.read(entry)
-            target = destination / ("source" + PurePosixPath(entry.filename).suffix.lower())
-            with target.open("xb") as stream:
-                stream.write(data)
+            if not candidates:
+                raise ValueError(f"{spec}: official ZIP contains no specification DOC/DOCX")
+            candidates.sort(key=lambda item: PurePosixPath(item.filename).name.lower())
+            if sum(item.file_size for item in candidates) > 512 * 1024 * 1024:
+                raise ValueError("uncompressed specification documents exceed 512 MiB")
+            members = []
+            paths = []
+            for index, entry in enumerate(candidates):
+                suffix = PurePosixPath(entry.filename).suffix.lower()
+                target = destination / (("source" if len(candidates) == 1 else f"part-{index:03d}") + suffix)
+                target.unlink(missing_ok=True)
+                data = bundle.read(entry)
+                with target.open("xb") as stream:
+                    stream.write(data)
+                members.append({"name": entry.filename, "sha256": hashlib.sha256(data).hexdigest()})
+                paths.append(target)
     except zipfile.BadZipFile as error:
         raise ValueError(f"{spec}: invalid official ZIP") from error
-    return target, {"archive_sha256": hashlib.sha256(archive).hexdigest(),
-                    "archive_member": entry.filename, "original_sha256": hashlib.sha256(data).hexdigest()}
+    archive_hash = sha256_file(archive) if isinstance(archive, Path) else hashlib.sha256(archive).hexdigest()
+    if len(paths) == 1:
+        return paths[0], {"archive_sha256": archive_hash,
+                          "archive_member": members[0]["name"], "original_sha256": members[0]["sha256"]}
+    converted = [convert_legacy_doc(path) if path.suffix == ".doc" else path for path in paths]
+    merged = destination / "source.docx"
+    merged.unlink(missing_ok=True)
+    ranges = merge_docx_parts(converted, merged)
+    for part, span in zip(members, ranges):
+        part["body_start"], part["body_end"] = span
+    return merged, {"archive_sha256": archive_hash, "archive_members": members,
+                    "conversion": "merged_official_parts"}
+
+
+def merge_docx_parts(parts: list[Path], output: Path) -> list[tuple[int, int]]:
+    """Merge ordered source bodies; verify that no supported text block is lost."""
+    if len(parts) < 2:
+        raise ValueError("multi-part merge requires at least two documents")
+    main = Document(parts[0])
+    bodies = [main.element.body]
+    source_text = []
+
+    def body_elements(body):
+        return [element for element in body if element.tag != qn("w:sectPr")]
+
+    def texts(elements):
+        return ["".join(element.xpath(".//w:t/text()")) for element in elements
+                if element.tag in {qn("w:p"), qn("w:tbl")}]
+
+    first = body_elements(bodies[0])
+    source_text.extend(texts(first))
+    ranges = [(0, len(first))]
+    position = len(first)
+    for path in parts[1:]:
+        body = Document(path).element.body
+        elements = body_elements(body)
+        source_text.extend(texts(elements))
+        start = position
+        for element in elements:
+            main.element.body.insert(position, deepcopy(element))
+            position += 1
+        ranges.append((start, position))
+    if texts(body_elements(main.element.body)) != source_text:
+        raise ValueError("multi-part merge changed source paragraph or table text")
+    main.save(output)
+    if texts(body_elements(Document(output).element.body)) != source_text:
+        output.unlink(missing_ok=True)
+        raise ValueError("saved multi-part DOCX changed source text")
+    return ranges
 
 
 def convert_legacy_doc(source: Path) -> Path:
-    """Windows Word conversion of our downloaded file in a separate hidden instance."""
-    if sys.platform != "win32":
-        raise ValueError("legacy DOC requires Windows Word conversion; active corpus was not changed")
+    """Convert an official legacy DOC with LibreOffice or Windows Word."""
     output = source.with_suffix('.docx')
     if output.exists():
         raise ValueError("conversion destination already exists")
+    libreoffice = shutil.which("libreoffice") or shutil.which("soffice")
+    if libreoffice:
+        with tempfile.TemporaryDirectory() as profile:
+            try:
+                completed = subprocess.run([libreoffice, "-env:UserInstallation=" + Path(profile).as_uri(),
+                    "--headless", "--convert-to", "docx", "--outdir", str(source.parent), str(source)],
+                    capture_output=True, timeout=180)
+            except subprocess.TimeoutExpired as error:
+                raise ValueError("legacy DOC conversion timed out") from error
+        if completed.returncode or not output.is_file():
+            raise ValueError("legacy DOC conversion failed; active corpus was not changed")
+        return output
+    if sys.platform != "win32":
+        raise ValueError("legacy DOC requires LibreOffice; active corpus was not changed")
     quote = lambda path: "'" + str(path.resolve()).replace("'", "''") + "'"
     script = f"""$ErrorActionPreference='Stop'; $word=$null; $doc=$null
 try {{
@@ -172,8 +245,11 @@ try {{
 }}
 """
     encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
-    completed = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
-                               capture_output=True, timeout=180)
+    try:
+        completed = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+                                   capture_output=True, timeout=180)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("legacy DOC conversion timed out") from error
     if completed.returncode or not output.is_file():
         raise ValueError("legacy DOC conversion failed; active corpus was not changed")
     return output
@@ -258,6 +334,11 @@ def sync_documents(corpus, manifest: Manifest, directory: str | Path, *, catalog
         status = corpus.ingest(load_manifest(lockfile))
         if not status['ingestion_complete']:
             raise ValueError(f"document ingestion failed in {baseline}; active corpus was not changed")
+        from spec_retriever.retrieval.reference_index import build_reference_index
+
+        reference_index = build_reference_index(corpus, baseline)
+        if not reference_index['complete']:
+            raise ValueError(f"reference indexing failed in {baseline}; active corpus was not changed")
         embedding = {'status': 'not_requested', 'reason': 'explicit_lexical_only'}
         if not lexical_only:
             embedding = {'status': 'complete', 'result': embed(corpus, baseline)}
@@ -271,6 +352,7 @@ def sync_documents(corpus, manifest: Manifest, directory: str | Path, *, catalog
         result = {'baseline': baseline, 'release': manifest.release, 'manifest': str(lockfile),
                   'manifest_sha256': updated.digest, 'database': str(Path(database).resolve()) if database else None,
                   'checked_at': catalog.checked_at, 'embedding': embedding, 'ingestion_complete': True,
+                  'reference_index': reference_index,
                   'embedding_profile': embedding_profile, 'published': True, 'unchanged': False,
                   'previous_baseline': manifest.baseline, 'missing_references': pending,
                   'unavailable_for_release': [row['spec'] for row in check['documents'] if not row['latest_version']],

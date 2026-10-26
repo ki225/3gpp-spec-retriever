@@ -4,7 +4,7 @@
 
 A tool for agents and skills to retrieve traceable evidence from 3GPP specifications.
 
-- Search documents, read complete clauses and tables, and follow references across specifications.
+- Search documents, read complete clauses and tables, and follow version-pinned references in both directions.
 - Pin each corpus baseline to exact versions and SHA-256 hashes.
 - Check official versions within the same Release, identify missing documents, and rebuild indexes and embeddings when updating.
 
@@ -14,7 +14,9 @@ SQLite provides local full-text retrieval. Elasticsearch and BGE-M3 add optional
 flowchart LR
     DOC["3GPP documents"] --> PIN["Version and hash pinning"]
     PIN --> STORE[("SQLite: clauses and tables")]
-    STORE --> RETRIEVE["Search, scan and reference tracing"]
+    STORE --> LINKS["Explicit reference index"]
+    LINKS --> RETRIEVE["Search, scan and bidirectional reference tracing"]
+    STORE --> RETRIEVE
     VECTOR[("Optional: Elasticsearch + BGE-M3")] -.-> RETRIEVE
     RETRIEVE --> EVIDENCE["Evidence with sources and gaps"]
     EVIDENCE --> AGENT["Agent / Skill analysis"]
@@ -34,7 +36,45 @@ python -m pip install -e ".[mcp]"
 
 On Linux/macOS, activate with `source .venv/bin/activate` instead.
 
-### 2. Index documents
+### 2. Build the full Release 17 corpus
+
+Create `%APPDATA%/3gpp-spec-retriever/config.yaml` on Windows, or
+`~/.config/3gpp-spec-retriever/config.yaml` on Linux/macOS:
+
+```yaml
+release: 17
+scope: all
+storage_root: /absolute/path/to/3gpp-data
+retrieval: sqlite
+```
+
+`scope: all` scans every official archive series and selects the latest `17.x.y`
+version of each specification, including TS and TR. Documents without a Release
+17 archive version are excluded and reported. The build requires Node.js 18+;
+legacy `.doc` sources require LibreOffice or Microsoft Word on Windows.
+
+```powershell
+python -m spec_retriever build --dry-run  # inspect the official inventory
+python -m spec_retriever build            # download, index, and publish
+```
+
+An interrupted build resumes its pinned inventory. Inspect `pending.json` and
+the run's `report.json` under `storage_root` for failures. Only a complete build
+updates `current.json`; until then, the previous published corpus remains active.
+For the configured corpus, start the MCP server with
+`python -m spec_retriever serve` and pass `baseline: "current"` to its tools.
+The build also indexes explicit cross-references before publication. For a corpus
+built by an older version of this tool, build that index once:
+
+```powershell
+python -m spec_retriever index-references --db /absolute/path/to/3gpp-data/corpus.sqlite3 --baseline YOUR_PUBLISHED_BASELINE
+```
+
+Read `current.json` under `storage_root` for the exact database path and baseline.
+Document updates rebuild the index before publication. If it is incomplete,
+retrieval falls back to live forward-reference parsing and reports that limitation.
+
+### 3. Index selected documents (optional)
 
 Download and extract an official DOCX. For example, save the document from the
 [TS 29.531 V17.12.0 archive](https://www.3gpp.org/ftp/specs/archive/29_series/29.531/29531-hc0.zip)
@@ -61,9 +101,10 @@ Document paths are relative to the manifest. This example pins a specific versio
 ```powershell
 python -m spec_retriever lock data/manifest.json --output data/baseline.lock.json
 python -m spec_retriever ingest data/baseline.lock.json --db data/corpus.sqlite3
+python -m spec_retriever index-references --db data/corpus.sqlite3 --baseline r17
 ```
 
-### 3. Retrieve evidence
+### 4. Retrieve evidence
 
 ```powershell
 # Check corpus availability and parsing warnings.
@@ -75,21 +116,25 @@ python -m spec_retriever clause --db data/corpus.sqlite3 --baseline r17 --spec 2
 
 # Collect related clauses and follow references, or scan all supported source blocks.
 python -m spec_retriever collect "NSSAI availability authorization" --db data/corpus.sqlite3 --baseline r17
+python -m spec_retriever references --db data/corpus.sqlite3 --baseline r17 --spec 29.531 --version 17.12.0 --clause 6.2.6.2.2 --direction both
 python -m spec_retriever scan --db data/corpus.sqlite3 --baseline r17 --term NSSAIAvailability
 ```
 
 Search and reference expansion have limits. Inspect reported gaps and pagination before drawing conclusions; the tool does not guarantee that every applicable requirement has been found.
+Use `references --direction incoming --offset N` (or MCP `get_references`) to
+paginate clauses that cite an exact versioned clause.
 
-### 4. Connect an agent
+### 5. Connect an agent
 
-Configure your MCP client with the virtual environment's absolute Python path and your database path:
+Configure your MCP client with the virtual environment's absolute Python path.
+The server reads the user-level YAML configuration and its published database:
 
 ```json
 {
   "mcpServers": {
     "3gpp-spec-retriever": {
       "command": "/absolute/path/to/.venv/bin/python",
-      "args": ["-m", "spec_retriever", "serve", "--db", "/absolute/path/to/data/corpus.sqlite3"]
+      "args": ["-m", "spec_retriever", "serve"]
     }
   }
 }
@@ -97,11 +142,11 @@ Configure your MCP client with the virtual environment's absolute Python path an
 
 On Windows, use the absolute path to `.venv/Scripts/python.exe`.
 
-The server exposes seven read-only tools: `search_specs`, `get_clause`, `get_corpus_status`, `list_clauses`, `expand_references`, `collect_evidence`, and `scan_corpus`. Pass the baseline name, such as `r17`, when querying.
+The server exposes eight read-only tools: `search_specs`, `get_clause`, `get_corpus_status`, `list_clauses`, `get_references`, `expand_references`, `collect_evidence`, and `scan_corpus`. Pass `baseline: "current"` to use the published corpus. For an independently indexed database, pass `--db /absolute/path/to/corpus.sqlite3` to `serve` and use its explicit baseline name.
 
 See the [agent skill](skills/3gpp-spec-retriever/SKILL.md) for the evidence collection workflow.
 
-### 5. Check and update documents
+### 6. Check and update documents
 
 Official archive access requires Node.js 18+. Check versions, local files, index status, and missing references:
 
@@ -124,7 +169,7 @@ python -m spec_retriever search "NssaiAvailabilityInfo" --db data/corpus.sqlite3
 
 Use `--required-spec` for expected documents, `--include-references` to select undated or same-Release references, and `--series` to compare an official series. Explicit version references remain pinned.
 
-### 6. Repair a failed DOCX import
+### 7. Repair a failed DOCX import
 
 When `ingest` reports `parse_failed`, the optional repair agent can reproduce the error in an isolated Git worktree, patch the parser, re-import the complete locked manifest, and request an independent read-only review. It opens a PR only after all checks pass. Install and authenticate the Codex and GitHub CLIs first:
 

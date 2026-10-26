@@ -55,6 +55,22 @@ class Corpus:
             CREATE INDEX IF NOT EXISTS documents_baseline ON documents(baseline, spec, version);
             CREATE INDEX IF NOT EXISTS clauses_document ON clauses(document_id, clause_id);
             CREATE INDEX IF NOT EXISTS chunks_clause ON chunks(clause_pk);
+            CREATE TABLE IF NOT EXISTS reference_edges (
+                id INTEGER PRIMARY KEY, source_clause_pk TEXT NOT NULL REFERENCES clauses(id) ON DELETE CASCADE,
+                source_baseline TEXT NOT NULL, target_clause_pk TEXT,
+                kind TEXT NOT NULL, status TEXT NOT NULL, reason TEXT,
+                reference_json TEXT NOT NULL, resolution_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS reference_edges_source ON reference_edges(source_clause_pk);
+            CREATE INDEX IF NOT EXISTS reference_edges_target ON reference_edges(target_clause_pk);
+            CREATE TABLE IF NOT EXISTS reference_index_documents (
+                document_id TEXT PRIMARY KEY, baseline TEXT NOT NULL, sha256 TEXT NOT NULL,
+                extractor_version INTEGER NOT NULL, edge_count INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS reference_index_state (
+                baseline TEXT PRIMARY KEY, manifest_digest TEXT NOT NULL,
+                extractor_version INTEGER NOT NULL, complete INTEGER NOT NULL
+            );
         """)
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(clauses)")}
         if "metadata" not in columns:
@@ -98,6 +114,8 @@ class Corpus:
             parsed.append((item, status, error, result))
 
         with self.connection:
+            self.connection.execute("DELETE FROM reference_index_state WHERE baseline=?", (manifest.baseline,))
+            self.connection.execute("DELETE FROM reference_index_documents WHERE baseline=?", (manifest.baseline,))
             self.connection.execute("INSERT OR IGNORE INTO baselines VALUES (?,?,?,?)",
                                     (manifest.baseline, manifest.release, manifest.digest, _json(manifest.payload())))
             # Remove previous evidence even for a document that now fails import.
@@ -127,6 +145,83 @@ class Corpus:
                         self.connection.execute("INSERT INTO chunks_fts VALUES (?,?)", (chunk["search_text"], chunk_id))
         return self.status(manifest.baseline)
 
+    def ingest_resumable(self, manifest: Manifest) -> dict:
+        """Commit documents one at a time so a large build can resume safely."""
+        existing = self.connection.execute("SELECT digest FROM baselines WHERE name=?", (manifest.baseline,)).fetchone()
+        if existing and existing["digest"] != manifest.digest:
+            raise ValueError("baseline already pins different manifest contents; choose a new baseline name")
+        with self.connection:
+            self.connection.execute("INSERT OR IGNORE INTO baselines VALUES (?,?,?,?)",
+                                    (manifest.baseline, manifest.release, manifest.digest, _json(manifest.payload())))
+        for item in manifest.documents:
+            if item.sha256 is None:
+                raise ValueError("ingest requires a locked manifest")
+            document_id = _id(manifest.baseline, item.spec, item.version)
+            path = manifest.document_path(item)
+            status, error, result = "indexed", None, None
+            try:
+                if sha256_file(path) != item.sha256:
+                    status, error = "checksum_mismatch", "source bytes do not match lockfile"
+                else:
+                    previous = self.connection.execute("SELECT status,sha256 FROM documents WHERE id=?",
+                                                       (document_id,)).fetchone()
+                    if previous and previous["status"] == "indexed" and previous["sha256"] == item.sha256:
+                        count = self.connection.execute("SELECT count(*) FROM clauses WHERE document_id=?",
+                                                        (document_id,)).fetchone()[0]
+                        if count:
+                            continue
+                    result = parse_docx(path, item)
+                    if not result.clauses:
+                        status, error, result = "parse_failed", "parser produced no clauses", None
+                    if result is not None:
+                        metadata_path = path.with_name("source.json")
+                        if metadata_path.is_file():
+                            source = json.loads(metadata_path.read_text(encoding="utf-8"))
+                            members = source.get("archive_members", [])
+                            for clause in result.clauses:
+                                for block in clause.blocks:
+                                    location = block["location"]
+                                    index = location["body_index"]
+                                    matches = [part for part in members
+                                               if part["body_start"] <= index < part["body_end"]]
+                                    if members and len(matches) != 1:
+                                        raise ValueError(f"multi-part source location is ambiguous at body index {index}")
+                                    if matches:
+                                        part = matches[0]
+                                        location["archive_member"] = part["name"]
+                                        location["archive_member_sha256"] = part["sha256"]
+                                        location["member_body_index"] = index - part["body_start"]
+            except FileNotFoundError:
+                status, error = "missing", "source DOCX does not exist"
+            except Exception as exception:
+                status, error = "parse_failed", f"{type(exception).__name__}: {exception}"
+            with self.connection:
+                self.connection.execute("DELETE FROM reference_index_state WHERE baseline=?", (manifest.baseline,))
+                self.connection.execute("DELETE FROM reference_index_documents WHERE document_id=?", (document_id,))
+                self.connection.execute("""DELETE FROM chunks_fts WHERE chunk_id IN (
+                    SELECT k.id FROM chunks k JOIN clauses c ON c.id=k.clause_pk
+                    WHERE c.document_id=?)""", (document_id,))
+                self.connection.execute("DELETE FROM chunks WHERE clause_pk IN (SELECT id FROM clauses WHERE document_id=?)",
+                                        (document_id,))
+                self.connection.execute("DELETE FROM clauses WHERE document_id=?", (document_id,))
+                self.connection.execute("DELETE FROM documents WHERE id=?", (document_id,))
+                warnings = result.warnings if result else []
+                self.connection.execute("INSERT INTO documents VALUES (?,?,?,?,?,?,?,?,?,?)", (
+                    document_id, manifest.baseline, item.spec, item.version, item.source_url,
+                    Path(item.path).name, item.sha256, status, error, _json(warnings)))
+                if result is None:
+                    continue
+                for clause in result.clauses:
+                    clause_pk = _id(document_id, clause.clause_id)
+                    metadata = {name: getattr(clause, name) for name in ("title", "title_path", "annex_type")}
+                    self.connection.execute("INSERT INTO clauses VALUES (?,?,?,?,?,?)", (
+                        clause_pk, document_id, clause.clause_id, clause.ordinal, _json(asdict(clause)), _json(metadata)))
+                    for index, chunk in enumerate(make_chunks(clause)):
+                        chunk_id = _id(clause_pk, str(index))
+                        self.connection.execute("INSERT INTO chunks VALUES (?,?,?)", (chunk_id, clause_pk, _json(chunk)))
+                        self.connection.execute("INSERT INTO chunks_fts VALUES (?,?)", (chunk["search_text"], chunk_id))
+        return self.status(manifest.baseline)
+
     def status(self, baseline: str) -> dict:
         row = self.connection.execute("SELECT * FROM baselines WHERE name=?", (baseline,)).fetchone()
         if row is None:
@@ -138,7 +233,9 @@ class Corpus:
             del item["id"]
             item["clause_count"] = self.connection.execute("SELECT count(*) FROM clauses WHERE document_id=?", (document["id"],)).fetchone()[0]
             documents.append(item)
-        ready = bool(documents) and all(item["status"] == "indexed" for item in documents)
+        expected_count = len(json.loads(row["manifest"])["documents"])
+        ready = (bool(documents) and len(documents) == expected_count
+                 and all(item["status"] == "indexed" for item in documents))
         return {
             "baseline": baseline, "release": row["release"], "manifest_sha256": row["digest"],
             "ingestion_complete": ready,
@@ -210,6 +307,9 @@ class Corpus:
             raise ValueError(f"exact clause not found: {baseline} / {spec} / {version} / {clause_id}")
         all_rows = self.connection.execute("SELECT * FROM clauses WHERE document_id=? ORDER BY ordinal", (row["document_id"],)).fetchall()
         all_clauses = [json.loads(item["payload"]) for item in all_rows]
+        printed_id = clause_id.split("~", 1)[0]
+        same_printed = [item["clause_id"] for item in all_clauses
+                        if item["clause_id"].split("~", 1)[0] == printed_id]
         descendants = []
         parents = {clause_id}
         for clause in all_clauses:
@@ -218,6 +318,8 @@ class Corpus:
                 descendants.append(clause)
         selected = json.loads(row["payload"])
         return {"baseline": baseline, "spec": spec, "version": version, "clause": selected,
+                "printed_clause_id": printed_id,
+                "same_printed_clause_ids": same_printed,
                 "source_url": row["source_url"], "filename": row["filename"], "sha256": row["sha256"],
                 "children_included": include_children,
                 "descendant_clause_ids": [item["clause_id"] for item in descendants],
@@ -237,7 +339,14 @@ class Corpus:
         """Return pinned entries, including failed imports, without substituting versions."""
         entries = []
         for baseline in dict.fromkeys(baselines):
-            entries.extend(item for item in self.status(baseline)["documents"] if item["spec"] == spec)
+            for row in self.connection.execute("SELECT * FROM documents WHERE baseline=? AND spec=?",
+                                               (baseline, spec)):
+                item = dict(row)
+                item["warnings"] = json.loads(item["warnings"])
+                item["clause_count"] = self.connection.execute(
+                    "SELECT count(*) FROM clauses WHERE document_id=?", (item["id"],)).fetchone()[0]
+                del item["id"]
+                entries.append(item)
         return entries
 
     def clause_records(self, baseline: str, spec: str, version: str):
