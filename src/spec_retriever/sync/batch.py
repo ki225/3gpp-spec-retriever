@@ -15,18 +15,9 @@ from uuid import uuid4
 from spec_retriever.config import Config
 from spec_retriever.spec_store.manifest import DocumentSpec, Manifest, load_manifest, sha256_file
 from spec_retriever.spec_store.store import Corpus
+from spec_retriever.sync.atomic import write_json as _write_json
 from spec_retriever.sync.official import OfficialCatalog, download_archive, fetch_bytes
 from spec_retriever.sync.service import convert_legacy_doc, extract_document
-
-
-def _write_json(path: Path, value: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name("." + path.name + "." + uuid4().hex)
-    with temporary.open("x", encoding="utf-8") as stream:
-        json.dump(value, stream, ensure_ascii=False, indent=2)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
 
 
 def _catalog_retry(operation):
