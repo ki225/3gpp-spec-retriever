@@ -134,6 +134,7 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--model", default="BAAI/bge-m3")
         command.add_argument("--device", default="cpu")
         command.add_argument("--index-prefix", default="3gpp-specs")
+    for command in (search, collection, evaluation, serve):
         command.add_argument("--rerank", action="store_true", help="rerank hybrid candidates with BGE-M3 ColBERT")
     return root
 
