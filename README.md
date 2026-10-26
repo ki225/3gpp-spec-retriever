@@ -4,7 +4,7 @@
 
 A tool for agents and skills to retrieve traceable evidence from 3GPP specifications.
 
-- Search documents, read complete clauses and tables, and follow references across specifications.
+- Search documents, read complete clauses and tables, and follow version-pinned references in both directions.
 - Pin each corpus baseline to exact versions and SHA-256 hashes.
 - Check official versions within the same Release, identify missing documents, and rebuild indexes and embeddings when updating.
 
@@ -14,7 +14,9 @@ SQLite provides local full-text retrieval. Elasticsearch and BGE-M3 add optional
 flowchart LR
     DOC["3GPP documents"] --> PIN["Version and hash pinning"]
     PIN --> STORE[("SQLite: clauses and tables")]
-    STORE --> RETRIEVE["Search, scan and reference tracing"]
+    STORE --> LINKS["Explicit reference index"]
+    LINKS --> RETRIEVE["Search, scan and bidirectional reference tracing"]
+    STORE --> RETRIEVE
     VECTOR[("Optional: Elasticsearch + BGE-M3")] -.-> RETRIEVE
     RETRIEVE --> EVIDENCE["Evidence with sources and gaps"]
     EVIDENCE --> AGENT["Agent / Skill analysis"]
@@ -61,6 +63,16 @@ the run's `report.json` under `storage_root` for failures. Only a complete build
 updates `current.json`; until then, the previous published corpus remains active.
 For the configured corpus, start the MCP server with
 `python -m spec_retriever serve` and pass `baseline: "current"` to its tools.
+The build also indexes explicit cross-references before publication. For a corpus
+built by an older version of this tool, build that index once:
+
+```powershell
+python -m spec_retriever index-references --db /absolute/path/to/3gpp-data/corpus.sqlite3 --baseline YOUR_PUBLISHED_BASELINE
+```
+
+Read `current.json` under `storage_root` for the exact database path and baseline.
+Document updates rebuild the index before publication. If it is incomplete,
+retrieval falls back to live forward-reference parsing and reports that limitation.
 
 ### 3. Index selected documents (optional)
 
@@ -89,6 +101,7 @@ Document paths are relative to the manifest. This example pins a specific versio
 ```powershell
 python -m spec_retriever lock data/manifest.json --output data/baseline.lock.json
 python -m spec_retriever ingest data/baseline.lock.json --db data/corpus.sqlite3
+python -m spec_retriever index-references --db data/corpus.sqlite3 --baseline r17
 ```
 
 ### 4. Retrieve evidence
@@ -103,10 +116,13 @@ python -m spec_retriever clause --db data/corpus.sqlite3 --baseline r17 --spec 2
 
 # Collect related clauses and follow references, or scan all supported source blocks.
 python -m spec_retriever collect "NSSAI availability authorization" --db data/corpus.sqlite3 --baseline r17
+python -m spec_retriever references --db data/corpus.sqlite3 --baseline r17 --spec 29.531 --version 17.12.0 --clause 6.2.6.2.2 --direction both
 python -m spec_retriever scan --db data/corpus.sqlite3 --baseline r17 --term NSSAIAvailability
 ```
 
 Search and reference expansion have limits. Inspect reported gaps and pagination before drawing conclusions; the tool does not guarantee that every applicable requirement has been found.
+Use `references --direction incoming --offset N` (or MCP `get_references`) to
+paginate clauses that cite an exact versioned clause.
 
 ### 5. Connect an agent
 
@@ -126,7 +142,7 @@ The server reads the user-level YAML configuration and its published database:
 
 On Windows, use the absolute path to `.venv/Scripts/python.exe`.
 
-The server exposes seven read-only tools: `search_specs`, `get_clause`, `get_corpus_status`, `list_clauses`, `expand_references`, `collect_evidence`, and `scan_corpus`. Pass `baseline: "current"` to use the published corpus. For an independently indexed database, pass `--db /absolute/path/to/corpus.sqlite3` to `serve` and use its explicit baseline name.
+The server exposes eight read-only tools: `search_specs`, `get_clause`, `get_corpus_status`, `list_clauses`, `get_references`, `expand_references`, `collect_evidence`, and `scan_corpus`. Pass `baseline: "current"` to use the published corpus. For an independently indexed database, pass `--db /absolute/path/to/corpus.sqlite3` to `serve` and use its explicit baseline name.
 
 See the [agent skill](skills/3gpp-spec-retriever/SKILL.md) for the evidence collection workflow.
 

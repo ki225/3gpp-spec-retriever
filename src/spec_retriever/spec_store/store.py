@@ -55,6 +55,22 @@ class Corpus:
             CREATE INDEX IF NOT EXISTS documents_baseline ON documents(baseline, spec, version);
             CREATE INDEX IF NOT EXISTS clauses_document ON clauses(document_id, clause_id);
             CREATE INDEX IF NOT EXISTS chunks_clause ON chunks(clause_pk);
+            CREATE TABLE IF NOT EXISTS reference_edges (
+                id INTEGER PRIMARY KEY, source_clause_pk TEXT NOT NULL REFERENCES clauses(id) ON DELETE CASCADE,
+                source_baseline TEXT NOT NULL, target_clause_pk TEXT,
+                kind TEXT NOT NULL, status TEXT NOT NULL, reason TEXT,
+                reference_json TEXT NOT NULL, resolution_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS reference_edges_source ON reference_edges(source_clause_pk);
+            CREATE INDEX IF NOT EXISTS reference_edges_target ON reference_edges(target_clause_pk);
+            CREATE TABLE IF NOT EXISTS reference_index_documents (
+                document_id TEXT PRIMARY KEY, baseline TEXT NOT NULL, sha256 TEXT NOT NULL,
+                extractor_version INTEGER NOT NULL, edge_count INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS reference_index_state (
+                baseline TEXT PRIMARY KEY, manifest_digest TEXT NOT NULL,
+                extractor_version INTEGER NOT NULL, complete INTEGER NOT NULL
+            );
         """)
         columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(clauses)")}
         if "metadata" not in columns:
@@ -98,6 +114,8 @@ class Corpus:
             parsed.append((item, status, error, result))
 
         with self.connection:
+            self.connection.execute("DELETE FROM reference_index_state WHERE baseline=?", (manifest.baseline,))
+            self.connection.execute("DELETE FROM reference_index_documents WHERE baseline=?", (manifest.baseline,))
             self.connection.execute("INSERT OR IGNORE INTO baselines VALUES (?,?,?,?)",
                                     (manifest.baseline, manifest.release, manifest.digest, _json(manifest.payload())))
             # Remove previous evidence even for a document that now fails import.
@@ -178,6 +196,8 @@ class Corpus:
             except Exception as exception:
                 status, error = "parse_failed", f"{type(exception).__name__}: {exception}"
             with self.connection:
+                self.connection.execute("DELETE FROM reference_index_state WHERE baseline=?", (manifest.baseline,))
+                self.connection.execute("DELETE FROM reference_index_documents WHERE document_id=?", (document_id,))
                 self.connection.execute("""DELETE FROM chunks_fts WHERE chunk_id IN (
                     SELECT k.id FROM chunks k JOIN clauses c ON c.id=k.clause_pk
                     WHERE c.document_id=?)""", (document_id,))
@@ -319,7 +339,14 @@ class Corpus:
         """Return pinned entries, including failed imports, without substituting versions."""
         entries = []
         for baseline in dict.fromkeys(baselines):
-            entries.extend(item for item in self.status(baseline)["documents"] if item["spec"] == spec)
+            for row in self.connection.execute("SELECT * FROM documents WHERE baseline=? AND spec=?",
+                                               (baseline, spec)):
+                item = dict(row)
+                item["warnings"] = json.loads(item["warnings"])
+                item["clause_count"] = self.connection.execute(
+                    "SELECT count(*) FROM clauses WHERE document_id=?", (item["id"],)).fetchone()[0]
+                del item["id"]
+                entries.append(item)
         return entries
 
     def clause_records(self, baseline: str, spec: str, version: str):

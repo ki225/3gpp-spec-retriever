@@ -334,6 +334,11 @@ def sync_documents(corpus, manifest: Manifest, directory: str | Path, *, catalog
         status = corpus.ingest(load_manifest(lockfile))
         if not status['ingestion_complete']:
             raise ValueError(f"document ingestion failed in {baseline}; active corpus was not changed")
+        from spec_retriever.retrieval.reference_index import build_reference_index
+
+        reference_index = build_reference_index(corpus, baseline)
+        if not reference_index['complete']:
+            raise ValueError(f"reference indexing failed in {baseline}; active corpus was not changed")
         embedding = {'status': 'not_requested', 'reason': 'explicit_lexical_only'}
         if not lexical_only:
             embedding = {'status': 'complete', 'result': embed(corpus, baseline)}
@@ -347,6 +352,7 @@ def sync_documents(corpus, manifest: Manifest, directory: str | Path, *, catalog
         result = {'baseline': baseline, 'release': manifest.release, 'manifest': str(lockfile),
                   'manifest_sha256': updated.digest, 'database': str(Path(database).resolve()) if database else None,
                   'checked_at': catalog.checked_at, 'embedding': embedding, 'ingestion_complete': True,
+                  'reference_index': reference_index,
                   'embedding_profile': embedding_profile, 'published': True, 'unchanged': False,
                   'previous_baseline': manifest.baseline, 'missing_references': pending,
                   'unavailable_for_release': [row['spec'] for row in check['documents'] if not row['latest_version']],

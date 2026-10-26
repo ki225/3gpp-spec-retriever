@@ -208,6 +208,7 @@ def build(config: Config, *, dry_run: bool = False, refresh: bool = False,
 
         baseline = None
         ingestion = None
+        reference_index = None
         # A partial inventory would produce a different manifest digest on
         # resume, forcing every already-indexed document to be parsed again.
         if documents and len(documents) == inventory["selected_count"] and not failures:
@@ -221,6 +222,13 @@ def build(config: Config, *, dry_run: bool = False, refresh: bool = False,
             for row in ingestion["documents"]:
                 if row["status"] != "indexed":
                     failures.append({"spec": row["spec"], "stage": "ingest", "error": row.get("error")})
+            if not failures:
+                from spec_retriever.retrieval.reference_index import build_reference_index
+
+                with Corpus(config.database) as corpus:
+                    reference_index = build_reference_index(corpus, baseline, progress=True)
+                if not reference_index["complete"]:
+                    failures.append({"stage": "reference_index", "error": "reference index incomplete"})
         complete = (bool(documents) and not failures and len(documents) == inventory["selected_count"]
                     and ingestion is not None and ingestion["ingestion_complete"])
         report = {"release": config.release, "scope": inventory["scope"],
@@ -228,6 +236,7 @@ def build(config: Config, *, dry_run: bool = False, refresh: bool = False,
                   "run": str(run), "baseline": baseline, "selected_count": inventory["selected_count"],
                   "downloaded_count": len(documents),
                   "indexed_count": sum(row["status"] == "indexed" for row in ingestion["documents"]) if ingestion else 0,
+                  "reference_index": reference_index,
                   "failures": failures, "complete": complete, "published": False}
         _write_json(run / "report.json", report)
         if complete:

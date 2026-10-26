@@ -21,6 +21,15 @@ def parser() -> argparse.ArgumentParser:
     ingest = commands.add_parser("ingest", help="index a locked corpus baseline")
     ingest.add_argument("manifest")
     ingest.add_argument("--db", required=True)
+    reference_index = commands.add_parser("index-references", help="build resumable version-pinned citation edges")
+    reference_index.add_argument("--db", required=True)
+    reference_index.add_argument("--baseline", required=True)
+    references = commands.add_parser("references", help="inspect incoming and outgoing clause references")
+    for flag in ("db", "baseline", "spec", "version", "clause"):
+        references.add_argument("--" + flag, required=True)
+    references.add_argument("--direction", choices=["outgoing", "incoming", "both"], default="both")
+    references.add_argument("--offset", type=int, default=0)
+    references.add_argument("--limit", type=int, default=100)
     search = commands.add_parser("search", help="search with provenance and import limitations")
     search.add_argument("query")
     search.add_argument("--db", required=True)
@@ -154,6 +163,8 @@ def _run_query(corpus, args, search_fn=None):
 
 
 def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     args = parser().parse_args(argv)
     try:
         from pathlib import Path
@@ -247,6 +258,16 @@ def main(argv: list[str] | None = None) -> int:
                             json.dump(result, stream, ensure_ascii=False, indent=2)
                 elif args.command == "ingest":
                     result = corpus.ingest(load_manifest(args.manifest))
+                elif args.command == "index-references":
+                    from spec_retriever.retrieval.reference_index import build_reference_index
+
+                    result = build_reference_index(corpus, args.baseline, progress=True)
+                elif args.command == "references":
+                    from spec_retriever.retrieval.reference_index import references_for_clause
+
+                    result = references_for_clause(corpus, {key: getattr(args, key) for key in
+                        ("baseline", "spec", "version", "clause")}, direction=args.direction,
+                        offset=args.offset, limit=args.limit)
                 elif args.command == "status":
                     result = corpus.status(args.baseline)
                 elif args.command == "scan":

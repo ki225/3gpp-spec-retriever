@@ -104,6 +104,8 @@ def create_server(database: str | Path, *, backend: str = "sqlite", model: str =
         baseline = resolve_baseline(baseline)
         with Corpus(database) as corpus:
             result = corpus.status(baseline)
+            from spec_retriever.retrieval.reference_index import index_status
+            result["reference_index"] = index_status(corpus, baseline)
         if requested == "current" and active_pointer is not None:
             import json
             pointer = json.loads(Path(active_pointer).read_text(encoding="utf-8"))
@@ -127,6 +129,17 @@ def create_server(database: str | Path, *, backend: str = "sqlite", model: str =
         baseline = resolve_baseline(baseline)
         with Corpus(database) as corpus:
             return corpus.list_clauses(baseline, spec, version, offset=offset, limit=limit)
+
+    @server.tool()
+    def get_references(baseline: str, spec: str, version: str, clause: str,
+                       direction: str = "both", offset: int = 0, limit: int = 100) -> dict:
+        """Inspect indexed explicit citations in either direction, including unresolved citations."""
+        from spec_retriever.retrieval.reference_index import references_for_clause
+
+        baseline = resolve_baseline(baseline)
+        with Corpus(database) as corpus:
+            return references_for_clause(corpus, {"baseline": baseline, "spec": spec,
+                "version": version, "clause": clause}, direction=direction, offset=offset, limit=limit)
 
     @server.tool()
     def expand_references(baseline: str, seeds: list[dict[str, str]], dependencies: list[str] | None = None,

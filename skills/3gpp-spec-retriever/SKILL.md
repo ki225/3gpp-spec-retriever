@@ -23,6 +23,11 @@ subclauses. Use `list_clauses` with pagination to navigate document-only referen
 `expand_references` accepts exact seed addresses and explicit dependency baselines
 when a reference points to an older Release. It never authorizes changing source
 versions or downloading missing documents without the surrounding task's scope.
+Check `reference_index.complete` in `get_corpus_status`. When complete,
+`get_references` can show both citations made by a clause and clauses citing it.
+`collect_evidence` includes a bounded set of incoming citations for search seeds;
+inspect `pending` for candidates omitted by that limit. When incomplete, it
+falls back to live forward parsing and cannot provide indexed reverse coverage.
 
 For requests to find all definitions behind an issue, build an explicit feature
 audit case. Identify architecture, Stage 2 procedures, Stage 3 API/resources,
@@ -71,10 +76,16 @@ spec-retriever collect "FEATURE QUESTION" --db CORPUS --baseline BASELINE --subq
 spec-retriever list-clauses --db CORPUS --baseline BASELINE --spec 29.571 --version 17.9.0
 spec-retriever clause --db CORPUS --baseline BASELINE --spec 29.571 --version 17.9.0 --clause 5.2.4.1 --include-children
 spec-retriever expand --db CORPUS --baseline BASELINE --seed 29.571@17.9.0:5.2.4.1
+spec-retriever references --db CORPUS --baseline BASELINE --spec 29.571 --version 17.9.0 --clause 5.2.4.1 --direction both
 spec-retriever scan --db CORPUS --baseline BASELINE --term "FEATURE TERM" --offset 0 --limit 100
 spec-retriever audit CASE_JSON --db CORPUS --output NEW_EVIDENCE_JSON
 spec-retriever review EVIDENCE_JSON REVIEW_JSON
 ```
+
+For an older corpus with no complete reference index, run `spec-retriever
+index-references --db CORPUS --baseline BASELINE` before relying on reverse
+citations. The official `build` and `sync-documents` workflows index references
+before publishing a new corpus.
 
 Resolve the actual corpus path and baseline from the project configuration or
 user context. Do not fabricate a local path, installed tool or successful result.
