@@ -134,6 +134,7 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument("--model", default="BAAI/bge-m3")
         command.add_argument("--device", default="cpu")
         command.add_argument("--index-prefix", default="3gpp-specs")
+    for command in (search, collection, evaluation, serve):
         command.add_argument("--rerank", action="store_true", help="rerank hybrid candidates with BGE-M3 ColBERT")
     return root
 
@@ -160,6 +161,67 @@ def _run_query(corpus, args, search_fn=None):
     from spec_retriever.workflows.evaluation import evaluate
 
     return evaluate(corpus, args.dataset, mode=args.mode, limit=args.limit, search_fn=search_fn)
+
+
+def _run_document_update(corpus, args):
+    from pathlib import Path
+    from spec_retriever.sync.service import check_documents, sync_documents
+
+    manifest = load_manifest(args.manifest)
+    options = dict(required_specs=args.required_spec, dependencies=args.dependency_baseline,
+                   include_references=args.include_references, series=args.series)
+    if args.command == "check-documents":
+        result = check_documents(corpus, manifest, **options)
+    elif args.lexical_only:
+        result = sync_documents(corpus, manifest, args.directory, lexical_only=True, force=args.force, **options)
+    else:
+        from spec_retriever.retrieval.elastic import BGEEmbedder, ElasticBackend, create_client, _fingerprint
+
+        client = create_client()
+        try:
+            def embed(store, baseline):
+                backend = ElasticBackend(client, BGEEmbedder(args.model, args.device), prefix=args.index_prefix)
+                return backend.sync(store, baseline)
+
+            def embedding_current(store, baseline):
+                import hashlib
+
+                alias = args.index_prefix + "-" + hashlib.sha256(baseline.encode()).hexdigest()[:16]
+                if not client.indices.exists_alias(name=alias):
+                    return False
+                mappings = client.indices.get_mapping(index=alias)
+                expected = _fingerprint(store.status(baseline), args.model)
+                return bool(mappings) and all(item["mappings"].get("_meta", {}).get("fingerprint") == expected
+                                              for item in mappings.values())
+
+            result = sync_documents(corpus, manifest, args.directory, embed=embed, force=args.force,
+                                    embedding_profile=args.model + ':' + args.index_prefix,
+                                    embedding_current=embedding_current, **options)
+        finally:
+            client.close()
+    if args.output:
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        with Path(args.output).open("x", encoding="utf-8") as stream:
+            json.dump(result, stream, ensure_ascii=False, indent=2)
+    return result
+
+
+def _run_elastic(corpus, args):
+    from spec_retriever.retrieval.elastic import BGEEmbedder, ElasticBackend, create_client
+
+    client = create_client()
+    try:
+        backend = ElasticBackend(client, BGEEmbedder(args.model, args.device), prefix=args.index_prefix)
+        if args.command == "sync-elastic":
+            return backend.sync(corpus, args.baseline)
+
+        def search_fn(query, baseline, *, limit=20, spec=None):
+            return backend.search(corpus, query, baseline, limit=limit, spec=spec,
+                                  rerank=args.rerank, rerank_candidates=max(40, limit))
+
+        return _run_query(corpus, args, search_fn)
+    finally:
+        client.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -219,43 +281,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             with Corpus(args.db) as corpus:
                 if args.command in {"check-documents", "sync-documents"}:
-                    from spec_retriever.sync.service import check_documents, sync_documents
-
-                    manifest = load_manifest(args.manifest)
-                    options = dict(required_specs=args.required_spec, dependencies=args.dependency_baseline,
-                                   include_references=args.include_references, series=args.series)
-                    if args.command == "check-documents":
-                        result = check_documents(corpus, manifest, **options)
-                    elif args.lexical_only:
-                        result = sync_documents(corpus, manifest, args.directory, lexical_only=True, force=args.force, **options)
-                    else:
-                        from spec_retriever.retrieval.elastic import BGEEmbedder, ElasticBackend, create_client, _fingerprint
-
-                        client = create_client()
-                        try:
-                            # Load model lazily, after the source check/download stage.
-                            def embed(store, baseline):
-                                backend = ElasticBackend(client, BGEEmbedder(args.model, args.device), prefix=args.index_prefix)
-                                return backend.sync(store, baseline)
-                            def embedding_current(store, baseline):
-                                import hashlib
-
-                                alias = args.index_prefix + "-" + hashlib.sha256(baseline.encode()).hexdigest()[:16]
-                                if not client.indices.exists_alias(name=alias):
-                                    return False
-                                mappings = client.indices.get_mapping(index=alias)
-                                expected = _fingerprint(store.status(baseline), args.model)
-                                return bool(mappings) and all(item["mappings"].get("_meta", {}).get("fingerprint") == expected
-                                                              for item in mappings.values())
-                            result = sync_documents(corpus, manifest, args.directory, embed=embed, force=args.force,
-                                                    embedding_profile=args.model + ':' + args.index_prefix,
-                                                    embedding_current=embedding_current, **options)
-                        finally:
-                            client.close()
-                    if args.output:
-                        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-                        with Path(args.output).open("x", encoding="utf-8") as stream:
-                            json.dump(result, stream, ensure_ascii=False, indent=2)
+                    result = _run_document_update(corpus, args)
                 elif args.command == "ingest":
                     result = corpus.ingest(load_manifest(args.manifest))
                 elif args.command == "index-references":
@@ -303,20 +329,7 @@ def main(argv: list[str] | None = None) -> int:
                 elif args.command in {"search", "collect", "evaluate"} and args.backend == "sqlite":
                     result = _run_query(corpus, args)
                 else:
-                    from spec_retriever.retrieval.elastic import BGEEmbedder, ElasticBackend, create_client
-
-                    client = create_client()
-                    try:
-                        backend = ElasticBackend(client, BGEEmbedder(args.model, args.device), prefix=args.index_prefix)
-                        if args.command == "sync-elastic":
-                            result = backend.sync(corpus, args.baseline)
-                        else:
-                            def search_fn(query, baseline, *, limit=20, spec=None):
-                                return backend.search(corpus, query, baseline, limit=limit, spec=spec,
-                                                      rerank=args.rerank, rerank_candidates=max(40, limit))
-                            result = _run_query(corpus, args, search_fn)
-                    finally:
-                        client.close()
+                    result = _run_elastic(corpus, args)
         displayed = result
         if args.command in {"check-documents", "sync-documents"} and args.output:
             displayed = {key: value for key, value in result.items() if key not in {"reference_inventory", "missing_references"}}

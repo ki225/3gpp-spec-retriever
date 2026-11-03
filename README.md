@@ -2,180 +2,61 @@
 
 ## Introduction
 
-A tool for agents and skills to retrieve traceable evidence from 3GPP specifications.
-
-- Search documents, read complete clauses and tables, and follow version-pinned references in both directions.
-- Pin each corpus baseline to exact versions and SHA-256 hashes.
-- Check official versions within the same Release, identify missing documents, and rebuild indexes and embeddings when updating.
-
-SQLite provides local full-text retrieval. Elasticsearch and BGE-M3 add optional hybrid search and ColBERT reranking. Results include source locations, version information, and unresolved gaps; the consuming agent performs compliance analysis.
+An MCP server and CLI that give agents traceable evidence from 3GPP specifications. It builds a local Release 17 corpus from official archives, pins document versions and hashes, and lets agents search clauses, read tables, and follow explicit cross-references. SQLite is the default search backend; Elasticsearch with BGE-M3 is optional.
 
 ```mermaid
 flowchart LR
-    DOC["3GPP documents"] --> PIN["Version and hash pinning"]
-    PIN --> STORE[("SQLite: clauses and tables")]
-    STORE --> LINKS["Explicit reference index"]
-    LINKS --> RETRIEVE["Search, scan and bidirectional reference tracing"]
-    STORE --> RETRIEVE
-    VECTOR[("Optional: Elasticsearch + BGE-M3")] -.-> RETRIEVE
-    RETRIEVE --> EVIDENCE["Evidence with sources and gaps"]
-    EVIDENCE --> AGENT["Agent / Skill analysis"]
+    A["Official 3GPP archives"] --> B["Version-pinned local corpus"]
+    B --> C["Search and cross-reference index"]
+    C --> D["MCP server / CLI"]
+    D --> E["Agent evidence review"]
 ```
 
 ## Usage
 
-### 1. Install
+Requires Python 3.11+ and Node.js 18+. Legacy `.doc` sources also require LibreOffice or Microsoft Word on Windows.
 
-Requires Python 3.11+. Run commands from the repository root using your virtual environment.
+1. Install the project:
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e ".[mcp]"
-```
+   ```bash
+   python -m venv .venv
+   .venv/bin/python -m pip install -e ".[mcp]"
+   ```
 
-On Linux/macOS, activate with `source .venv/bin/activate` instead.
+   On Windows, use `.venv/Scripts/python.exe` in place of `.venv/bin/python`. Use that environment's Python for the remaining commands.
 
-### 2. Build the full Release 17 corpus
+2. Create `%APPDATA%/3gpp-spec-retriever/config.yaml` on Windows or `~/.config/3gpp-spec-retriever/config.yaml` on Linux/macOS:
 
-Create `%APPDATA%/3gpp-spec-retriever/config.yaml` on Windows, or
-`~/.config/3gpp-spec-retriever/config.yaml` on Linux/macOS:
+   ```yaml
+   release: 17
+   scope: all
+   storage_root: /absolute/path/to/3gpp-data
+   retrieval: sqlite
+   ```
 
-```yaml
-release: 17
-scope: all
-storage_root: /absolute/path/to/3gpp-data
-retrieval: sqlite
-```
+3. Build the corpus and start the MCP server:
 
-`scope: all` scans every official archive series and selects the latest `17.x.y`
-version of each specification, including TS and TR. Documents without a Release
-17 archive version are excluded and reported. The build requires Node.js 18+;
-legacy `.doc` sources require LibreOffice or Microsoft Word on Windows.
+   ```bash
+   python -m spec_retriever build --dry-run
+   python -m spec_retriever build
+   python -m spec_retriever serve
+   ```
 
-```powershell
-python -m spec_retriever build --dry-run  # inspect the official inventory
-python -m spec_retriever build            # download, index, and publish
-```
+   The build selects the latest `17.x.y` archive of every specification with a Release 17 version. An interrupted build resumes automatically. `current.json` is published only after all selected documents and their cross-references are indexed. If the build fails, inspect `pending.json` and the run's `report.json` under `storage_root`.
 
-An interrupted build resumes its pinned inventory. Inspect `pending.json` and
-the run's `report.json` under `storage_root` for failures. Only a complete build
-updates `current.json`; until then, the previous published corpus remains active.
-For the configured corpus, start the MCP server with
-`python -m spec_retriever serve` and pass `baseline: "current"` to its tools.
-The build also indexes explicit cross-references before publication. For a corpus
-built by an older version of this tool, build that index once:
+4. Point your MCP client at the virtual environment's Python executable:
 
-```powershell
-python -m spec_retriever index-references --db /absolute/path/to/3gpp-data/corpus.sqlite3 --baseline YOUR_PUBLISHED_BASELINE
-```
+   ```json
+   {
+     "mcpServers": {
+       "3gpp-spec-retriever": {
+         "command": "/absolute/path/to/.venv/bin/python",
+         "args": ["-m", "spec_retriever", "serve"]
+       }
+     }
+   }
+   ```
 
-Read `current.json` under `storage_root` for the exact database path and baseline.
-Document updates rebuild the index before publication. If it is incomplete,
-retrieval falls back to live forward-reference parsing and reports that limitation.
+   On Windows, use `.venv/Scripts/python.exe`. Pass `baseline: "current"` to the MCP tools. The [agent skill](skills/3gpp-spec-retriever/SKILL.md) describes the evidence workflow.
 
-### 3. Index selected documents (optional)
-
-Download and extract an official DOCX. For example, save the document from the
-[TS 29.531 V17.12.0 archive](https://www.3gpp.org/ftp/specs/archive/29_series/29.531/29531-hc0.zip)
-as `data/29531-hc0.docx`. Create `data/manifest.json`:
-
-```json
-{
-  "schema_version": 1,
-  "baseline": "r17",
-  "release": 17,
-  "documents": [
-    {
-      "spec": "29.531",
-      "version": "17.12.0",
-      "path": "29531-hc0.docx",
-      "source_url": "https://www.3gpp.org/ftp/specs/archive/29_series/29.531/29531-hc0.zip"
-    }
-  ]
-}
-```
-
-Document paths are relative to the manifest. This example pins a specific version; use the checks below to verify freshness.
-
-```powershell
-python -m spec_retriever lock data/manifest.json --output data/baseline.lock.json
-python -m spec_retriever ingest data/baseline.lock.json --db data/corpus.sqlite3
-python -m spec_retriever index-references --db data/corpus.sqlite3 --baseline r17
-```
-
-### 4. Retrieve evidence
-
-```powershell
-# Check corpus availability and parsing warnings.
-python -m spec_retriever status --db data/corpus.sqlite3 --baseline r17
-
-# Search, then read a complete clause.
-python -m spec_retriever search "NssaiAvailabilityInfo" --db data/corpus.sqlite3 --baseline r17
-python -m spec_retriever clause --db data/corpus.sqlite3 --baseline r17 --spec 29.531 --version 17.12.0 --clause 6.2.6.2.2
-
-# Collect related clauses and follow references, or scan all supported source blocks.
-python -m spec_retriever collect "NSSAI availability authorization" --db data/corpus.sqlite3 --baseline r17
-python -m spec_retriever references --db data/corpus.sqlite3 --baseline r17 --spec 29.531 --version 17.12.0 --clause 6.2.6.2.2 --direction both
-python -m spec_retriever scan --db data/corpus.sqlite3 --baseline r17 --term NSSAIAvailability
-```
-
-Search and reference expansion have limits. Inspect reported gaps and pagination before drawing conclusions; the tool does not guarantee that every applicable requirement has been found.
-Use `references --direction incoming --offset N` (or MCP `get_references`) to
-paginate clauses that cite an exact versioned clause.
-
-### 5. Connect an agent
-
-Configure your MCP client with the virtual environment's absolute Python path.
-The server reads the user-level YAML configuration and its published database:
-
-```json
-{
-  "mcpServers": {
-    "3gpp-spec-retriever": {
-      "command": "/absolute/path/to/.venv/bin/python",
-      "args": ["-m", "spec_retriever", "serve"]
-    }
-  }
-}
-```
-
-On Windows, use the absolute path to `.venv/Scripts/python.exe`.
-
-The server exposes eight read-only tools: `search_specs`, `get_clause`, `get_corpus_status`, `list_clauses`, `get_references`, `expand_references`, `collect_evidence`, and `scan_corpus`. Pass `baseline: "current"` to use the published corpus. For an independently indexed database, pass `--db /absolute/path/to/corpus.sqlite3` to `serve` and use its explicit baseline name.
-
-See the [agent skill](skills/3gpp-spec-retriever/SKILL.md) for the evidence collection workflow.
-
-### 6. Check and update documents
-
-Official archive access requires Node.js 18+. Check versions, local files, index status, and missing references:
-
-```powershell
-python -m spec_retriever check-documents data/baseline.lock.json --db data/corpus.sqlite3
-```
-
-To download updates and rebuild embeddings, install the optional backend and start Elasticsearch 8.x first. Set `ELASTICSEARCH_URL` if it is not at `http://localhost:9200`.
-
-```powershell
-python -m pip install -e ".[elastic]"
-python -m spec_retriever sync-documents data/baseline.lock.json --db data/corpus.sqlite3 --directory data/managed
-```
-
-Add `--lexical-only` to update SQLite without embeddings or Elasticsearch. Updates publish a new baseline only after the selected build steps succeed and preserve the previous generation on failure. Query the active version with:
-
-```powershell
-python -m spec_retriever search "NssaiAvailabilityInfo" --db data/corpus.sqlite3 --baseline "@data/managed/current.json"
-```
-
-Use `--required-spec` for expected documents, `--include-references` to select undated or same-Release references, and `--series` to compare an official series. Explicit version references remain pinned.
-
-### 7. Repair a failed DOCX import
-
-When `ingest` reports `parse_failed`, the optional repair agent can reproduce the error in an isolated Git worktree, patch the parser, re-import the complete locked manifest, and request an independent read-only review. It opens a PR only after all checks pass. Install and authenticate the Codex and GitHub CLIs first:
-
-```powershell
-docker build -f docker/self-heal.Dockerfile -t 3gpp-spec-retriever-validator:1 .
-python -m spec_retriever heal-import data/baseline.lock.json --db data/corpus.sqlite3
-```
-
-Use `--no-pr` to exercise the repair and validation without pushing a branch. A report and worktree remain under the ignored `evaluation/self-heal/` directory. The agent repairs code-level import failures; use `sync-documents` for missing, damaged, or outdated source files. It never modifies the official DOCX or merges its own PR.
+For CLI retrieval, run `python -m spec_retriever search "PFCP Session Modification" --db /absolute/path/to/3gpp-data/corpus.sqlite3 --baseline @/absolute/path/to/3gpp-data/current.json`. Use `python -m spec_retriever --help` for clause lookup, corpus status, reference tracing, document checks and updates, and import repair. Results report provenance, incomplete coverage, and pagination; an agent must still assess which clauses apply.

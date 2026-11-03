@@ -91,6 +91,24 @@ class Corpus:
     def __exit__(self, *_):
         self.close()
 
+    def _write_document(self, baseline, item, status, error, result):
+        document_id = _id(baseline, item.spec, item.version)
+        warnings = result.warnings if result else []
+        self.connection.execute("INSERT INTO documents VALUES (?,?,?,?,?,?,?,?,?,?)", (
+            document_id, baseline, item.spec, item.version, item.source_url,
+            Path(item.path).name, item.sha256, status, error, _json(warnings)))
+        if result is None:
+            return
+        for clause in result.clauses:
+            clause_pk = _id(document_id, clause.clause_id)
+            metadata = {name: getattr(clause, name) for name in ("title", "title_path", "annex_type")}
+            self.connection.execute("INSERT INTO clauses VALUES (?,?,?,?,?,?)", (
+                clause_pk, document_id, clause.clause_id, clause.ordinal, _json(asdict(clause)), _json(metadata)))
+            for index, chunk in enumerate(make_chunks(clause)):
+                chunk_id = _id(clause_pk, str(index))
+                self.connection.execute("INSERT INTO chunks VALUES (?,?,?)", (chunk_id, clause_pk, _json(chunk)))
+                self.connection.execute("INSERT INTO chunks_fts VALUES (?,?)", (chunk["search_text"], chunk_id))
+
     def ingest(self, manifest: Manifest) -> dict:
         existing = self.connection.execute("SELECT digest FROM baselines WHERE name=?", (manifest.baseline,)).fetchone()
         if existing and existing["digest"] != manifest.digest:
@@ -127,22 +145,7 @@ class Corpus:
             self.connection.execute("DELETE FROM clauses WHERE document_id IN (SELECT id FROM documents WHERE baseline=?)", (manifest.baseline,))
             self.connection.execute("DELETE FROM documents WHERE baseline=?", (manifest.baseline,))
             for item, status, error, result in parsed:
-                document_id = _id(manifest.baseline, item.spec, item.version)
-                warnings = result.warnings if result else []
-                self.connection.execute("INSERT INTO documents VALUES (?,?,?,?,?,?,?,?,?,?)", (
-                    document_id, manifest.baseline, item.spec, item.version, item.source_url,
-                    Path(item.path).name, item.sha256, status, error, _json(warnings)))
-                if result is None:
-                    continue
-                for clause in result.clauses:
-                    clause_pk = _id(document_id, clause.clause_id)
-                    metadata = {name: getattr(clause, name) for name in ("title", "title_path", "annex_type")}
-                    self.connection.execute("INSERT INTO clauses VALUES (?,?,?,?,?,?)", (
-                        clause_pk, document_id, clause.clause_id, clause.ordinal, _json(asdict(clause)), _json(metadata)))
-                    for index, chunk in enumerate(make_chunks(clause)):
-                        chunk_id = _id(clause_pk, str(index))
-                        self.connection.execute("INSERT INTO chunks VALUES (?,?,?)", (chunk_id, clause_pk, _json(chunk)))
-                        self.connection.execute("INSERT INTO chunks_fts VALUES (?,?)", (chunk["search_text"], chunk_id))
+                self._write_document(manifest.baseline, item, status, error, result)
         return self.status(manifest.baseline)
 
     def ingest_resumable(self, manifest: Manifest) -> dict:
@@ -205,33 +208,23 @@ class Corpus:
                                         (document_id,))
                 self.connection.execute("DELETE FROM clauses WHERE document_id=?", (document_id,))
                 self.connection.execute("DELETE FROM documents WHERE id=?", (document_id,))
-                warnings = result.warnings if result else []
-                self.connection.execute("INSERT INTO documents VALUES (?,?,?,?,?,?,?,?,?,?)", (
-                    document_id, manifest.baseline, item.spec, item.version, item.source_url,
-                    Path(item.path).name, item.sha256, status, error, _json(warnings)))
-                if result is None:
-                    continue
-                for clause in result.clauses:
-                    clause_pk = _id(document_id, clause.clause_id)
-                    metadata = {name: getattr(clause, name) for name in ("title", "title_path", "annex_type")}
-                    self.connection.execute("INSERT INTO clauses VALUES (?,?,?,?,?,?)", (
-                        clause_pk, document_id, clause.clause_id, clause.ordinal, _json(asdict(clause)), _json(metadata)))
-                    for index, chunk in enumerate(make_chunks(clause)):
-                        chunk_id = _id(clause_pk, str(index))
-                        self.connection.execute("INSERT INTO chunks VALUES (?,?,?)", (chunk_id, clause_pk, _json(chunk)))
-                        self.connection.execute("INSERT INTO chunks_fts VALUES (?,?)", (chunk["search_text"], chunk_id))
+                self._write_document(manifest.baseline, item, status, error, result)
         return self.status(manifest.baseline)
 
     def status(self, baseline: str) -> dict:
         row = self.connection.execute("SELECT * FROM baselines WHERE name=?", (baseline,)).fetchone()
         if row is None:
             raise ValueError(f"unknown baseline: {baseline}")
+        clause_counts = {item["document_id"]: item["count"] for item in self.connection.execute(
+            """SELECT document_id, count(*) AS count FROM clauses
+            WHERE document_id IN (SELECT id FROM documents WHERE baseline=?) GROUP BY document_id""",
+            (baseline,))}
         documents = []
         for document in self.connection.execute("SELECT * FROM documents WHERE baseline=? ORDER BY spec", (baseline,)):
             item = dict(document)
             item["warnings"] = json.loads(item["warnings"])
             del item["id"]
-            item["clause_count"] = self.connection.execute("SELECT count(*) FROM clauses WHERE document_id=?", (document["id"],)).fetchone()[0]
+            item["clause_count"] = clause_counts.get(document["id"], 0)
             documents.append(item)
         expected_count = len(json.loads(row["manifest"])["documents"])
         ready = (bool(documents) and len(documents) == expected_count

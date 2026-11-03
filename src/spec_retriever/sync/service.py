@@ -22,6 +22,7 @@ from docx import Document
 from docx.oxml.ns import qn
 
 from spec_retriever.spec_store.manifest import DocumentSpec, Manifest, load_manifest, sha256_file
+from spec_retriever.sync.atomic import write_json
 from spec_retriever.sync.official import OfficialCatalog, fetch_bytes
 from spec_retriever.retrieval.references import bibliography
 
@@ -232,7 +233,8 @@ def convert_legacy_doc(source: Path) -> Path:
         return output
     if sys.platform != "win32":
         raise ValueError("legacy DOC requires LibreOffice; active corpus was not changed")
-    quote = lambda path: "'" + str(path.resolve()).replace("'", "''") + "'"
+    def quote(path):
+        return "'" + str(path.resolve()).replace("'", "''") + "'"
     script = f"""$ErrorActionPreference='Stop'; $word=$null; $doc=$null
 try {{
  $word=New-Object -ComObject Word.Application
@@ -360,12 +362,7 @@ def sync_documents(corpus, manifest: Manifest, directory: str | Path, *, catalog
                   'active_pointer': str(root / 'current.json')}
         # Publication is last: partial download/parse/embedding leaves old pointer
         # and every prior immutable baseline usable.
-        temporary = root / ('.current-' + uuid4().hex + '.json')
-        with temporary.open('x', encoding='utf-8') as stream:
-            json.dump(result, stream, ensure_ascii=False, indent=2)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, root / 'current.json')
+        write_json(root / 'current.json', result)
         return result
     finally:
         lock.unlink()

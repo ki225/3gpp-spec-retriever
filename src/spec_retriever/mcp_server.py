@@ -29,16 +29,17 @@ def create_server(database: str | Path, *, backend: str = "sqlite", model: str =
     state = {}
     model_lock, inference_lock = Lock(), Lock()
 
-    def resolve_baseline(baseline: str) -> str:
-        if baseline != "current":
-            return baseline
+    def published_pointer() -> dict:
         if active_pointer is None:
             raise ValueError("current requires a configured active corpus pointer")
         import json
         pointer = json.loads(Path(active_pointer).read_text(encoding="utf-8"))
         if not pointer.get("complete") or Path(pointer["database"]).resolve() != Path(database).resolve():
             raise ValueError("active corpus pointer is incomplete or belongs to a different database")
-        return pointer["baseline"]
+        return pointer
+
+    def resolve_baseline(baseline: str) -> str:
+        return published_pointer()["baseline"] if baseline == "current" else baseline
 
     def elastic_backend():
         from spec_retriever.retrieval.elastic import BGEEmbedder, ElasticBackend, create_client
@@ -108,7 +109,7 @@ def create_server(database: str | Path, *, backend: str = "sqlite", model: str =
             result["reference_index"] = index_status(corpus, baseline)
         if requested == "current" and active_pointer is not None:
             import json
-            pointer = json.loads(Path(active_pointer).read_text(encoding="utf-8"))
+            pointer = published_pointer()
             result["build_scope"] = pointer.get("scope")
             result["selected_count"] = pointer.get("selected_count")
             result["indexed_count"] = pointer.get("indexed_count")

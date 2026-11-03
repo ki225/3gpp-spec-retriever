@@ -19,7 +19,6 @@ class Config:
     release: int
     storage_root: Path
     retrieval: str = "sqlite"
-    scope: str = "all"
 
     @property
     def database(self) -> Path:
